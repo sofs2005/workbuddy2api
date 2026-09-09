@@ -1,5 +1,8 @@
 services:
   wb2api:
+    # 已发布镜像（master 推送后由 .github/workflows/docker.yml 自动构建推送）
+    image: ghcr.io/sofs2005/workbuddy2api:latest
+    # 保留 build 段：想从源码本地构建时用 docker compose up -d --build
     build: .
     container_name: workbuddy2api
     restart: unless-stopped

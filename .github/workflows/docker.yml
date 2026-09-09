@@ -1,0 +1,113 @@
+name: docker
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  # 同一 ref 上的并发构建：后一次覆盖前一次，避免旧提交的构建最后完成、
+  # 把 latest 指回旧代码
+  group: docker-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  IMAGE_NAME: ghcr.io/${{ github.repository }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=latest,enable=true
+            type=sha,enable=true,format=short,prefix=sha-
+          labels: |
+            org.opencontainers.image.title=workbuddy2api
+            org.opencontainers.image.description=OpenAI-compatible reverse proxy for WorkBuddy CN
+            org.opencontainers.image.licenses=MIT
+
+      # 先本地加载并冒烟：latest 一旦推上去就会被引流，不能在推之后才发现起不来
+      - name: Build (load for smoke test)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64
+          load: true
+          push: false
+          tags: ${{ env.IMAGE_NAME }}:smoke
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: false
+
+      - name: Smoke test
+        run: |
+          set -euo pipefail
+          docker run -d --name smoke -p 7863:7863 "${IMAGE_NAME}:smoke"
+          trap 'docker logs smoke || true; docker rm -f smoke || true' EXIT
+
+          # 无账号时 /healthz 按设计返回 503，因此 200/503 都算服务已起；
+          # 拿不到 HTTP 响应码（连接被拒/进程退出）才算失败
+          for _ in $(seq 1 30); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 \
+              http://127.0.0.1:7863/healthz || true)
+            if [ "$code" = "200" ] || [ "$code" = "503" ]; then
+              echo "smoke ok: /healthz -> $code"
+              exit 0
+            fi
+            sleep 1
+          done
+
+          echo "::error::smoke test failed: /healthz never answered"
+          exit 1
+
+      - name: Build and push
+        id: push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          provenance: false
+
+      - name: Summary
+        # 经 env 传值，避免把表达式直接拼进 shell（脚本注入面）
+        env:
+          TAGS: ${{ steps.meta.outputs.tags }}
+          DIGEST: ${{ steps.push.outputs.digest }}
+        run: |
+          {
+            echo "### 镜像已发布"
+            echo
+            echo '```'
+            printf '%s\n' "$TAGS"
+            echo '```'
+            echo
+            echo "digest: \`$DIGEST\`"
+          } >> "$GITHUB_STEP_SUMMARY"
