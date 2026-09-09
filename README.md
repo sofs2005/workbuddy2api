@@ -29,10 +29,21 @@ cp config.example.json config.json
 
 ### 2. 添加账号
 
+宿主机无需 Go / python3，登录工具已内置在镜像里：
+
 ```bash
-./login.sh
-# 打开浏览器登录 → 按 y → 自动落盘 auths/ → 重启容器
+docker run --rm -it -v "$PWD/auths:/app/auths" --user root \
+  --entrypoint /app/login ghcr.io/sofs2005/workbuddy2api:latest
+# 打开浏览器登录 → 按 y → 自动签到并落盘 auths/ → 重启容器
 ```
+
+登录完成后重启服务加载新账号：
+
+```bash
+docker compose restart
+```
+
+> 有 Go 环境的机器也可以用 `./login.sh`（首次自动编译 `cmd/login`）。
 
 ### 3. 启动服务
 

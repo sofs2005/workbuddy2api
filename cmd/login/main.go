@@ -1,180 +1,190 @@
-// login.go — WorkBuddy CN OAuth 登录（与 CPA 插件 /root/qoderwork/workbuddy/oauth.go
-// 的 handleStartLogin + handlePollLogin 逐字一致的实现，CN realm only）。
+// Command login — WorkBuddy CN OAuth 登录 → 落盘 auth 文件。
 //
-// 两个子命令，由 login.sh 顺序驱动：
+// 设计前提：宿主机不必装 Go / python3，整个流程在容器内一次跑完
+// （state 只存活于进程内存，不再落 /tmp，因此 url 与 poll 不能拆成两次
+// docker run —— 那会丢 state）。
 //
-//	login url   → POST /v2/plugin/auth/state?platform=CLI 拿 state+authUrl，
-//	              state 落 /tmp/wb2api-login-state.json，stdout 打印授权 URL
-//	login poll  → 读 state，GET /v2/plugin/auth/token?state= 一次，
-//	              成功再 GET /v2/plugin/login/account?state= 拿 uid/nickname，
-//	              stdout 打印完整 token+account JSON
+//	docker run --rm -it -v "$PWD/auths:/app/auths" --user root \
+//	  --entrypoint /app/login ghcr.io/sofs2005/workbuddy2api:latest
 //
-// 无 PKCE（workbuddy 设备流由服务端签发 state，与 qoderwork 不同）。
+// 流程：
+//  1. POST /v2/plugin/auth/state 拿授权 URL（无 PKCE，state 由服务端签发）
+//  2. 你在浏览器打开 URL 完成登录
+//  3. 回到这里按 y → poll 拿 token+uid+nickname → 签到 → 落盘 auths/workbuddy-<uid>.json
+//  4. 重启 workbuddy2api 容器加载新账号
 package main
 
 import (
-	"bytes"
-	"encoding/json"
+	"bufio"
+	"flag"
 	"fmt"
-	"io"
-	"net/http"
-	"net/http/cookiejar"
 	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
 	"time"
+
+	"workbuddy2api/internal/auth"
+	"workbuddy2api/internal/upstream"
 )
 
-// 与 /root/qoderwork/workbuddy/main.go:82-96 完全一致的常量（CN only）
-const (
-	upstreamBaseCN    = "https://copilot.tencent.com"
-	clientUA          = "CLI/2.63.2 CodeBuddy/2.63.2"
-	originReferer     = "https://www.codebuddy.cn"
-	endpointAuthState = upstreamBaseCN + "/v2/plugin/auth/state?platform=CLI"
-	endpointLoginAcct = upstreamBaseCN + "/v2/plugin/login/account?state="
-	endpointAuthToken = upstreamBaseCN + "/v2/plugin/auth/token?state="
-	stateFile         = "/tmp/wb2api-login-state.json"
-)
-
-// commonHeaders 与 main.go:496-503 一致
-func commonHeaders(req *http.Request) {
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "application/json, text/plain, */*")
-	req.Header.Set("X-Requested-With", "XMLHttpRequest")
-	req.Header.Set("Origin", originReferer)
-	req.Header.Set("Referer", originReferer+"/")
-	req.Header.Set("User-Agent", clientUA)
-}
-
-// apiEnvelope 与 main.go:429-433 一致
-type apiEnvelope struct {
-	Code int             `json:"code"`
-	Msg  string          `json:"msg"`
-	Data json.RawMessage `json:"data"`
-}
-
-// doJSON 与 oauth.go:33-66 一致：{code,msg,data} 信封，code!=0 → error
-func doJSON(client *http.Client, method, fullURL string, headers func(*http.Request), body io.Reader) (json.RawMessage, int, error) {
-	req, err := http.NewRequest(method, fullURL, body)
-	if err != nil {
-		return nil, 0, err
-	}
-	if headers != nil {
-		headers(req)
-	} else {
-		commonHeaders(req)
-	}
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, 0, err
-	}
-	defer resp.Body.Close()
-	raw, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode >= 400 {
-		return nil, resp.StatusCode, fmt.Errorf("http_error: upstream %d", resp.StatusCode)
-	}
-	if resp.StatusCode >= 300 {
-		return nil, resp.StatusCode, fmt.Errorf("http_error: upstream redirect %d", resp.StatusCode)
-	}
-	var env apiEnvelope
-	if err := json.Unmarshal(raw, &env); err != nil {
-		return nil, resp.StatusCode, fmt.Errorf("parse failed: %w", err)
-	}
-	if env.Code != 0 {
-		return nil, resp.StatusCode, fmt.Errorf("code=%d msg=%s", env.Code, env.Msg)
-	}
-	return env.Data, resp.StatusCode, nil
-}
-
-func fatal(format string, args ...any) {
-	fmt.Fprintf(os.Stderr, "login: "+format+"\n", args...)
-	os.Exit(1)
-}
-
-type loginState struct {
-	State string `json:"state"`
-}
+// appUID 镜像内服务进程 uid（Dockerfile: adduser -u 10001 app）。
+// 以 root 登录落盘时把文件 chown 给它，保证服务容器可读写 auths（token 续期要回写）。
+const appUID = 10001
 
 func main() {
-	if len(os.Args) < 2 {
-		fatal("usage: login <url|poll>")
+	authDir := flag.String("auth-dir", envOr("AUTH_DIR", "/app/auths"), "auth 文件落盘目录")
+	chownUID := flag.Int("chown-uid", appUID, "以 root 运行时把产物 chown 给该 uid；0 表示不 chown")
+	flag.Parse()
+
+	if err := run(*authDir, *chownUID); err != nil {
+		fmt.Fprintf(os.Stderr, "login: %v\n", err)
+		os.Exit(1)
 	}
-	// 每个流程独立 cookie jar（oauth.go:22-29：多账号登录互不串会话）
-	jar, _ := cookiejar.New(nil)
-	client := &http.Client{Timeout: 30 * time.Second, Jar: jar}
+}
 
-	switch os.Args[1] {
-	case "url":
-		// handleStartLogin (oauth.go:68-87)
-		data, _, err := doJSON(client, http.MethodPost, endpointAuthState, nil, bytes.NewReader([]byte("{}")))
-		if err != nil {
-			fatal("auth state failed: %v", err)
-		}
-		var st struct {
-			State   string `json:"state"`
-			AuthURL string `json:"authUrl"`
-		}
-		if err := json.Unmarshal(data, &st); err != nil || st.State == "" || st.AuthURL == "" {
-			fatal("auth state: missing state or authUrl")
-		}
-		raw, _ := json.Marshal(loginState{State: st.State})
-		if err := os.WriteFile(stateFile, raw, 0o600); err != nil {
-			fatal("write state: %v", err)
-		}
-		fmt.Println(st.AuthURL)
-
-	case "poll":
-		raw, err := os.ReadFile(stateFile)
-		if err != nil {
-			fatal("read state: %v (先跑 login url)", err)
-		}
-		var ls loginState
-		if err := json.Unmarshal(raw, &ls); err != nil {
-			fatal("parse state: %v", err)
-		}
-		// handlePollLogin (oauth.go:108-162)：auth/token 是权威登录状态端点，
-		// pending 时业务 code 非 0（"login ing"），完成时 code=0 + token bundle
-		tokRaw, status, errTok := doJSON(client, http.MethodGet, endpointAuthToken+ls.State, nil, nil)
-		if errTok != nil {
-			if status == 0 || status >= 500 {
-				fatal("token endpoint error: %v", errTok)
-			}
-			fatal("登录未完成（waiting for login）。请确认已在浏览器完成登录再按 y")
-		}
-		var tok struct {
-			AccessToken  string `json:"accessToken"`
-			RefreshToken string `json:"refreshToken"`
-			ExpiresIn    int64  `json:"expiresIn"`
-			Domain       string `json:"domain"`
-		}
-		if err := json.Unmarshal(tokRaw, &tok); err != nil || tok.AccessToken == "" {
-			fatal("登录未完成（waiting for login）。请确认已在浏览器完成登录再按 y")
-		}
-		// login/account 拿 uid/nickname（带 Bearer）
-		var acct struct {
-			UID          string `json:"uid"`
-			EnterpriseID string `json:"enterpriseId"`
-			Nickname     string `json:"nickname"`
-		}
-		acctHeaders := func(r *http.Request) {
-			commonHeaders(r)
-			r.Header.Set("Authorization", "Bearer "+tok.AccessToken)
-		}
-		if acctRaw, _, errAcct := doJSON(client, http.MethodGet, endpointLoginAcct+ls.State, acctHeaders, nil); errAcct == nil {
-			_ = json.Unmarshal(acctRaw, &acct)
-		}
-		out := map[string]any{
-			"access_token":  tok.AccessToken,
-			"refresh_token": tok.RefreshToken,
-			"expires_in":    tok.ExpiresIn,
-			"domain":        tok.Domain,
-			"uid":           acct.UID,
-			"enterprise_id": acct.EnterpriseID,
-			"nickname":      acct.Nickname,
-		}
-		oraw, _ := json.Marshal(out)
-		fmt.Println(string(oraw))
-		os.Remove(stateFile)
-
-	default:
-		fatal("unknown subcommand %q (want url|poll)", os.Args[1])
+func envOr(key, def string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
 	}
+	return def
+}
+
+func run(authDir string, chownUID int) error {
+	if err := os.MkdirAll(authDir, 0o755); err != nil {
+		return fmt.Errorf("创建 auth 目录: %w", err)
+	}
+
+	client := newLoginClient()
+
+	authURL, state, err := startAuth(client)
+	if err != nil {
+		return err
+	}
+
+	fmt.Println("============================================================")
+	fmt.Println("  WorkBuddy OAuth 登录")
+	fmt.Println("============================================================")
+	fmt.Println()
+	fmt.Println("请在浏览器中打开以下链接完成登录：")
+	fmt.Println()
+	fmt.Println("  " + authURL)
+	fmt.Println()
+
+	// 容器内无剪贴板，直接等用户在浏览器登录后回来确认
+	fmt.Print("完成登录后按 y 继续: ")
+	ans, err := bufio.NewReader(os.Stdin).ReadString('\n')
+	if err != nil {
+		return fmt.Errorf("读取输入失败（需要 -it 交互模式）: %w", err)
+	}
+	ans = strings.ToLower(strings.TrimSpace(ans))
+	if ans != "y" && ans != "yes" {
+		return fmt.Errorf("已取消")
+	}
+
+	fmt.Println()
+	fmt.Println("正在获取 token...")
+
+	tb, err := pollAuth(client, state)
+	if err != nil {
+		fmt.Fprintln(os.Stderr)
+		fmt.Fprintln(os.Stderr, "获取 token 失败。可能原因：")
+		fmt.Fprintln(os.Stderr, "  - 登录还没完成就按了 y（重新运行再试）")
+		fmt.Fprintln(os.Stderr, "  - 登录页报错（把报错截图发出来排查）")
+		return err
+	}
+
+	// ─── 签到（CN 幂等，失败不阻断登录）─────────────────────────
+	doCheckin(tb)
+
+	// ─── 落盘 auth 文件（与 internal/auth 读取格式一致）─────────────
+	a := &auth.Auth{
+		AccessToken:  tb.AccessToken,
+		RefreshToken: tb.RefreshToken,
+		ExpiresAt:    time.Now().Unix() + tb.ExpiresIn,
+		Domain:       tb.Domain,
+		UID:          tb.UID,
+		EnterpriseID: tb.EnterpriseID,
+		Nickname:     tb.Nickname,
+	}
+	file := filepath.Join(authDir, "workbuddy-"+tb.UID+".json")
+	a.FilePath = file
+
+	if _, statErr := os.Stat(file); statErr == nil {
+		fmt.Printf("账号已存在（uid=%s），将覆盖更新凭证\n", tb.UID)
+	} else {
+		fmt.Printf("新账号（uid=%s），新增 auth 文件\n", tb.UID)
+	}
+
+	if err := a.SaveAtomic(); err != nil {
+		return fmt.Errorf("写入 auth 文件: %w", err)
+	}
+	// 服务端 refresh 后要回写文件，权限必须是服务进程可读可写
+	if err := os.Chmod(file, 0o600); err != nil {
+		return fmt.Errorf("chmod auth 文件: %w", err)
+	}
+	if err := chownToService(file, authDir, chownUID); err != nil {
+		return err
+	}
+
+	fmt.Printf("已保存: %s\n", file)
+	fmt.Println()
+	fmt.Println("============================================================")
+	fmt.Println("  登录完成！")
+	fmt.Println("  UID:      " + tb.UID)
+	fmt.Println("  Nickname: " + displayOr(tb.Nickname, "（未获取到）"))
+	fmt.Println("  Token:    " + truncate(tb.AccessToken, 30) + "...")
+	fmt.Println("  有效期:   " + time.Unix(a.ExpiresAt, 0).Format("2006-01-02 15:04"))
+	fmt.Println("============================================================")
+	fmt.Println()
+	fmt.Println("重启服务加载新账号：docker compose restart")
+	return nil
+}
+
+// doCheckin 首次签到（幂等）。失败仅提示，不阻断——调度器每日 09:00/21:00 会重试。
+func doCheckin(tb tokenBundle) {
+	a := &auth.Auth{
+		AccessToken:  tb.AccessToken,
+		RefreshToken: tb.RefreshToken,
+		Domain:       tb.Domain,
+		UID:          tb.UID,
+		EnterpriseID: tb.EnterpriseID,
+		Nickname:     tb.Nickname,
+	}
+	if err := upstream.New().DailyCheckin(a); err != nil {
+		fmt.Printf("签到: 失败（%v）—— 调度器会于 09:00/21:00 重试\n", err)
+		return
+	}
+	fmt.Println("签到: 成功")
+}
+
+// chownToService 以 root 运行时把产物归属改给服务进程，避免宿主目录属主
+// 与服务容器 uid 不一致导致 token 续期回写失败。
+func chownToService(file, dir string, uid int) error {
+	if uid <= 0 || os.Geteuid() != 0 {
+		return nil
+	}
+	if err := os.Chown(dir, uid, uid); err != nil {
+		return fmt.Errorf("chown auth 目录: %w", err)
+	}
+	if err := os.Chown(file, uid, uid); err != nil {
+		return fmt.Errorf("chown auth 文件: %w", err)
+	}
+	fmt.Printf("已将 %s 归属改为 uid=%s（服务进程）\n", dir, strconv.Itoa(uid))
+	return nil
+}
+
+func displayOr(s, def string) string {
+	if strings.TrimSpace(s) == "" {
+		return def
+	}
+	return s
+}
+
+func truncate(s string, n int) string {
+	s = strings.TrimSpace(s)
+	if len(s) > n {
+		return s[:n]
+	}
+	return s
 }

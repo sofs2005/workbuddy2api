@@ -4,7 +4,8 @@ WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
-RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/wb2api ./cmd/server
+RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/wb2api ./cmd/server \
+ && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/login ./cmd/login
 
 # alpine:3.20 已于 2026-04-01 EOL，apk 源下线后构建会失败，保持使用仍在支持期的分支
 FROM alpine:3.22
@@ -15,6 +16,10 @@ RUN apk add --no-cache wget ca-certificates tzdata \
 USER app
 WORKDIR /app
 COPY --from=build /out/wb2api /app/wb2api
+# 运维工具：宿主机无 Go 环境时用容器完成 OAuth 登录
+#   docker run --rm -it -v "$PWD/auths:/app/auths" --user root \
+#     --entrypoint /app/login ghcr.io/sofs2005/workbuddy2api:latest
+COPY --from=build /out/login /app/login
 # 内置默认配置：config.json 含密钥不入库，CI 从仓库构建时用它兜底。
 # 实际部署请挂载真实 config.json 覆盖此文件（docker-compose.yml 已默认挂载）。
 COPY config.example.json /app/config.json

@@ -75,13 +75,19 @@ jobs:
               http://127.0.0.1:7863/healthz || true)
             if [ "$code" = "200" ] || [ "$code" = "503" ]; then
               echo "smoke ok: /healthz -> $code"
-              exit 0
+              break
             fi
             sleep 1
+            if [ "$_" = "30" ]; then
+              echo "::error::smoke test failed: /healthz never answered"
+              exit 1
+            fi
           done
 
-          echo "::error::smoke test failed: /healthz never answered"
-          exit 1
+          # login 工具存在且可执行（不打真实 OAuth 请求）
+          docker exec smoke /app/login -h >/dev/null 2>&1 \
+            || { echo "::error::login binary failed"; exit 1; }
+          echo "login binary ok"
 
       - name: Build and push
         id: push
