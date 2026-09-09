@@ -21,7 +21,7 @@
 ### 1. 克隆 & 配置
 
 ```bash
-git clone https://github.com/Sliverkiss/workbuddy2api.git
+git clone https://github.com/sofs2005/workbuddy2api.git
 cd workbuddy2api
 cp config.example.json config.json
 # 编辑 config.json，设置 api_key
@@ -37,10 +37,22 @@ cp config.example.json config.json
 ### 3. 启动服务
 
 ```bash
+docker compose up -d
+```
+
+默认拉取已构建好的镜像 `ghcr.io/sofs2005/workbuddy2api:latest`；想从源码本地构建则加 `--build`：
+
+```bash
 docker compose up -d --build
 ```
 
-### 4. 验证
+### 4. 更新到最新版本
+
+```bash
+docker compose pull && docker compose up -d
+```
+
+### 5. 验证
 
 ```bash
 # 模型列表
