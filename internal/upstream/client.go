@@ -4,6 +4,7 @@ package upstream
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -112,6 +113,16 @@ type apiEnvelope struct {
 type Client struct {
 	HTTP *http.Client
 
+	// ChatHTTP 聊天 SSE 专用 client：无总时长上限（Timeout=0），首字节由
+	// Transport.ResponseHeaderTimeout 约束，流中空闲由 IdleTimeout 约束。
+	// 与 HTTP 共享同一个 *http.Transport 实例，连接池不重复。
+	ChatHTTP *http.Client
+
+	// HeaderTimeout 聊天 SSE 首字节前（响应头）超时；<=0 表示未设置（回落 HTTP.Timeout）。
+	HeaderTimeout time.Duration
+	// IdleTimeout 聊天 SSE 流中空闲超时；<=0 表示禁用空闲监控。
+	IdleTimeout time.Duration
+
 	// effortsMu/efforts 缓存各模型 supportedEfforts（FetchModels 刷新），供请求体 effort 降级。
 	effortsMu sync.RWMutex
 	efforts   map[string][]string
@@ -119,10 +130,8 @@ type Client struct {
 	// SanitizeFingerprints 出站请求体黑名单指纹脱敏开关（默认 true；false 完全还原）。
 	SanitizeFingerprints bool
 
-	ChatBaseCN      string
-	BillingBaseCN   string
-	ChatBaseGlobal  string
-	BillingBaseGlob string
+	ChatBaseCN    string
+	BillingBaseCN string
 }
 
 // New 生产默认值。配置连接池减少 TLS 握手。
@@ -131,21 +140,27 @@ func New() *Client {
 		MaxIdleConns:        100,
 		MaxIdleConnsPerHost: 20,
 		IdleConnTimeout:     90 * time.Second,
+		// 聊天 SSE 首字节前硬上限（对短 RPC 无实际影响：其总时长 120s 更先到期）。
+		ResponseHeaderTimeout: 120 * time.Second,
 	}
 	return &Client{
 		HTTP:                 &http.Client{Timeout: 120 * time.Second, Transport: tr},
+		ChatHTTP:             &http.Client{Timeout: 0, Transport: tr}, // 无总时长；首字节由 ResponseHeaderTimeout 管
 		SanitizeFingerprints: true,
 		ChatBaseCN:           "https://copilot.tencent.com",
 		BillingBaseCN:        "https://www.codebuddy.cn",
-		ChatBaseGlobal:       "https://www.workbuddy.ai",
-		BillingBaseGlob:      "https://www.workbuddy.ai",
 	}
 }
 
-func (c *Client) chatBase(a *auth.Auth) string {
-	if a != nil && a.Region() == "global" {
-		return c.ChatBaseGlobal
+// chatHTTP 返回聊天专用 client；未设置（如测试只注入 HTTP）时回落 HTTP。
+func (c *Client) chatHTTP() *http.Client {
+	if c.ChatHTTP != nil {
+		return c.ChatHTTP
 	}
+	return c.HTTP
+}
+
+func (c *Client) chatBase(a *auth.Auth) string {
 	return c.ChatBaseCN
 }
 
@@ -169,9 +184,6 @@ func (c *Client) effortsSnapshot() map[string][]string {
 }
 
 func (c *Client) billingBase(a *auth.Auth) string {
-	if a != nil && a.Region() == "global" {
-		return c.BillingBaseGlob
-	}
 	return c.BillingBaseCN
 }
 
@@ -252,20 +264,27 @@ func (c *Client) ChatStream(a *auth.Auth, body []byte) (rc io.ReadCloser, status
 		return nil, 0, nil, err
 	}
 	ChatHeaders(req, a)
-	resp, err := c.HTTP.Do(req)
+	ctx, cancel := context.WithCancel(context.Background())
+	req = req.WithContext(ctx)
+	resp, err := c.chatHTTP().Do(req)
 	if err != nil {
+		cancel()
 		log.Printf("chat_stream uid=%s: transport error: %v", a.UID, err)
 		return nil, 0, nil, err
 	}
 	if resp.StatusCode >= 400 {
 		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 		resp.Body.Close()
+		cancel()
 		kind := Classify(resp.StatusCode, string(raw))
 		log.Printf("chat_stream uid=%s: upstream %d %s body=%s",
 			a.UID, resp.StatusCode, kind, truncate(string(raw), 200))
 		return nil, resp.StatusCode, raw, nil
 	}
-	return resp.Body, resp.StatusCode, nil, nil
+	// 成功分支：cancel 所有权交给 monitorBody（其 Close 会 cancel）；
+	// IdleTimeout<=0 时 monitorBody 原样返回底流、无人调 cancel——可接受：
+	// ctx 无 deadline 无 goroutine，连接由 resp.Body.Close 正常清理。
+	return monitorBody(resp.Body, c.IdleTimeout, cancel), resp.StatusCode, nil, nil
 }
 
 // ModelInfo 动态模型信息（含 maxInputTokens/maxOutputTokens）。

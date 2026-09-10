@@ -1,5 +1,5 @@
 // Package auth 解析 WorkBuddy auth 文件（嵌套形/扁平形双形态），
-// 提供 region 判定与 refresh 后的原子写回。
+// 提供 refresh 后的原子写回。
 package auth
 
 import (
@@ -12,7 +12,7 @@ import (
 	"time"
 )
 
-// Auth 是归一化后的账号凭证（来源可以是插件 OAuth 嵌套形或 CPA 面板扁平形）。
+// Auth 是归一化后的账号凭证（来源可以是插件 OAuth 嵌套形或手写扁平形）。
 type Auth struct {
 	// mu 串行化 RefreshToken 写与 SaveAtomic 读，防止并发写回半更新 token。
 	mu sync.Mutex
@@ -33,18 +33,6 @@ func (a *Auth) Lock() { a.mu.Lock() }
 // Unlock 释放 a.Lock 获取的锁。
 func (a *Auth) Unlock() { a.mu.Unlock() }
 
-// globalSuffix 判定全球区（global）账号的域名后缀；子域（如 www./api.）也属于全球区。
-const globalSuffix = ".workbuddy.ai"
-
-// Region 返回 "cn" 或 "global"。domain 为空视为 CN（向后兼容）。
-func (a *Auth) Region() string {
-	d := strings.ToLower(strings.TrimSpace(a.Domain))
-	if d == strings.TrimPrefix(globalSuffix, ".") || strings.HasSuffix(d, globalSuffix) {
-		return "global"
-	}
-	return "cn"
-}
-
 // NeedsRefresh 报告 token 是否将在 within 内过期（或已过期/无 expiry）。
 func (a *Auth) NeedsRefresh(within time.Duration) bool {
 	if a.ExpiresAt <= 0 {
@@ -56,7 +44,7 @@ func (a *Auth) NeedsRefresh(within time.Duration) bool {
 // Parse 兼容两种磁盘形态：
 //
 //	嵌套形 {"auth":{...},"account":{...}}  （插件 OAuth 输出）
-//	扁平形 {"accessToken":...,"uid":...}   （CPA 面板手建）
+//	扁平形 {"accessToken":...,"uid":...}   （手写/旧版）
 func Parse(raw []byte) (*Auth, error) {
 	if len(raw) == 0 {
 		return nil, fmt.Errorf("empty auth storage")
@@ -121,7 +109,7 @@ func Parse(raw []byte) (*Auth, error) {
 	return &a, nil
 }
 
-// SaveAtomic 以嵌套形原子写回 FilePath（tmp + rename），保持 CPA 插件可读格式。
+// SaveAtomic 以嵌套形原子写回 FilePath（tmp + rename），保持嵌套形（插件可读）格式。
 // 全程持 a.mu：防止与 RefreshToken 修改 token 字段并发，杜绝写回半更新。
 // 防御：accessToken 为空时拒绝写回，避免误用空凭证覆盖有效文件。
 func (a *Auth) SaveAtomic() error {
@@ -157,9 +145,8 @@ func (a *Auth) SaveAtomic() error {
 	return os.Rename(tmp, a.FilePath)
 }
 
-// LoadDir 扫描 dir 下 workbuddy*.json，只收 wantRegion（"cn"/"global"）。
-// 解析失败与 region 不符的文件静默跳过（启动日志由调用方统计）。
-func LoadDir(dir, wantRegion string) ([]*Auth, error) {
+// LoadDir 扫描并解析 dir 下 workbuddy*.json；解析失败的文件静默跳过（启动日志由调用方统计）。
+func LoadDir(dir string) ([]*Auth, error) {
 	files, err := filepath.Glob(filepath.Join(dir, "workbuddy*.json"))
 	if err != nil {
 		return nil, err
@@ -171,7 +158,7 @@ func LoadDir(dir, wantRegion string) ([]*Auth, error) {
 			continue
 		}
 		a, err := Parse(raw)
-		if err != nil || a.Region() != wantRegion {
+		if err != nil {
 			continue
 		}
 		a.FilePath = f
