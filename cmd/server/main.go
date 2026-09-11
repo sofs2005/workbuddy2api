@@ -54,6 +54,7 @@ func main() {
 	// 熔断器 + 在途上限 + 三因子加权调优（从 config 注入，非正值回退默认）。
 	p.SetBreaker(cfg.Pool.BreakerThreshold, cfg.BreakerCooldownDur, cfg.BreakerCooldownMaxD)
 	p.SetMaxInFlight(cfg.Pool.MaxInFlight)
+	p.SetSoftRateMax(cfg.SoftRateMaxDur) // 软冷却指数退避封顶（soft_rate_max，默认 2h）
 	p.SetWeights(cfg.Pool.IdleWeightPerHour, cfg.Pool.IdleWeightMax)
 
 	// 会话粘性路由（可配关闭）。
@@ -93,11 +94,24 @@ func main() {
 	up.SanitizeFingerprints = cfg.Features.SanitizeBlacklistFingerprints
 
 	sch := scheduler.New(scheduler.Config{
-		Pool:           p,
-		Upstream:       up,
-		CheckinHours:   cfg.Schedule.CheckinHours,
-		KeepaliveHours: cfg.Schedule.KeepaliveHours,
+		Pool:              p,
+		Upstream:          up,
+		CheckinHours:      cfg.Schedule.CheckinHours,
+		KeepaliveHours:    cfg.Schedule.KeepaliveHours,
+		CheckinDisabled:   !cfg.Schedule.CheckinEnabled,
+		KeepaliveDisabled: !cfg.Schedule.KeepaliveEnabled,
 	})
+	switch {
+	case !cfg.Schedule.CheckinEnabled:
+		log.Printf("签到已禁用（schedule.checkin_enabled=false）：猫猫旅行同时停摆（搭签到便车）")
+	case len(cfg.Schedule.CheckinHours) == 0:
+		log.Printf("猫猫旅行已合并到签到时点执行：签到 + 派猫 + 领取旅行奖励")
+	default:
+		log.Printf("猫猫旅行已合并到签到时点执行：签到 + 派猫 + 领取旅行奖励（%v 点）", cfg.Schedule.CheckinHours)
+	}
+	if !cfg.Schedule.KeepaliveEnabled {
+		log.Printf("token 保活已禁用（schedule.keepalive_enabled=false）")
+	}
 
 	h := server.NewHandler(server.Config{
 		Pool:         p,

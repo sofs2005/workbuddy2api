@@ -34,12 +34,12 @@ WorkBuddy2API 是一个自托管的 **OpenAI 兼容反向代理网关**，将腾
 |---|---|
 | 🔑 **OAuth 一键登录** | `login.sh` 设备授权流程（无 PKCE），自动落盘凭证并重启容器 |
 | 🔄 **多账号池** | 三因子加权随机选号（积分比例 ×10 + 闲置补偿 + 成功率 ×3），Top-5 候选 + 防惊群 |
-| 🛡️ **熔断与冷却** | 429/404 软冷却、402/余额不足硬冷却至次日 04:00、连续失败指数退避熔断、在途租约限流 |
+| 🛡️ **熔断与冷却** | 429/限流文案软冷却 600s 起指数退避（封顶 `soft_rate_max`）、404 固定 60s 短冷却、402/余额不足硬冷却至次日 04:00、连续失败指数退避熔断、在途租约限流 |
 | 🧲 **会话粘性** | 同一会话（`conversation_id`）尽量绑定同一账号，TTL 滚动续期，失败自动解绑 |
-| ⏰ **定时任务** | 每日 09:00 / 21:00 自动签到 + 余额查询解冻；22:00 全账号 token 刷新保活 |
+| ⏰ **定时任务** | 每日 09:00 / 21:00 自动签到 + 余额查询解冻 + 猫猫旅行（派猫/领奖）；22:00 全账号 token 刷新保活 |
 | ⚡ **流式 + 非流式** | 上游 SSE 逐帧规范化透传；出站强制 `stream:true`，非流式由本地聚合为单响应 |
 | 🧠 **推理模型兼容** | `reasoning_content` 白名单保留、工具调用（`tool_calls`）按 index 合并、effort 自动降级 |
-| 📊 **可观测** | 每请求一行表格日志（TTFB/token 速率/uid）；`/healthz` 可接负载均衡 |
+| 📊 **可观测** | 每请求一行表格日志（TTFB/token 速率/uid）；`/healthz` 带 `service` 身份标识可接负载均衡/宿主探活 |
 | 💾 **状态持久化** | 池状态本地原子落盘 + Upstash Redis 异步镜像（可选），重启择新恢复 |
 | 🗑️ **指纹脱敏** | 出站请求体黑名单指纹字段清洗（可关闭） |
 
@@ -54,7 +54,7 @@ flowchart LR
         H --> S
         P["账号池\n三因子加权 · 熔断 · 冷却 · 租约"] --> U
         S["会话粘性路由"] -.绑定镜像.-> REDIS
-        T["定时调度\n签到 09/21 · 保活 22"] --> P
+        T["定时调度\n签到 09/21 · 保活 22 · 旅行 30m"] --> P
         U["上游 Client\nChatHTTP 流式 · 短 RPC"]
     end
 
@@ -129,8 +129,9 @@ docker compose pull && docker compose up -d
 ### 5. 验证
 
 ```bash
-# 健康检查（无可用账号时 503）
+# 健康检查（无可用账号时 503）；service 字段用于确认打到的是本网关
 curl -s http://localhost:7863/healthz
+# {"healthy":2,"total":3,"service":"workbuddy2api"}
 
 # 模型列表
 curl -s http://localhost:7863/v1/models \
@@ -163,8 +164,13 @@ curl -s http://localhost:7863/v1/chat/completions \
   "api_key": "your-api-key-here",
   "auth_dir": "./auths",
   "state_file": "./data/state.json",
-  "cooldown": { "soft_rate": "60s" },
-  "schedule": { "checkin_hours": [9, 21], "keepalive_hours": [22] },
+  "cooldown": { "soft_rate": "600s", "soft_rate_max": "2h" },
+  "schedule": {
+    "checkin_hours": [9, 21],
+    "keepalive_hours": [22],
+    "checkin_enabled": true,
+    "keepalive_enabled": true
+  },
   "upstream": {
     "timeout_seconds": 120,
     "header_timeout_seconds": 120,
@@ -192,9 +198,12 @@ curl -s http://localhost:7863/v1/chat/completions \
 | `api_key` | 空 | 网关鉴权密钥；**空 = 不鉴权直接放行**（公网必须设置） |
 | `auth_dir` | `./auths` | 账号凭证目录 |
 | `state_file` | `./data/state.json` | 账号池状态持久化文件 |
-| `cooldown.soft_rate` | `60s` | 429/404 软冷却时长 |
-| `schedule.checkin_hours` | `[9, 21]` | 每日本地时区整点签到 + 余额查询 |
-| `schedule.keepalive_hours` | `[22]` | 每日本地时区整点刷新 token 保活 |
+| `cooldown.soft_rate` | `600s` | 软限流（429/限流文案）冷却**基数**；同一账号连续触发按 2 倍指数退避 |
+| `cooldown.soft_rate_max` | `2h` | 软冷却指数退避的封顶时长 |
+| `schedule.checkin_hours` | `[9, 21]` | 每日本地时区整点签到 + 余额查询；收尾顺带跑一趟猫猫旅行。**空数组/`null` = 未配置回落默认**（不是禁用） |
+| `schedule.keepalive_hours` | `[22]` | 每日本地时区整点刷新 token 保活。空数组/`null` 同上 |
+| `schedule.checkin_enabled` | `true` | 签到**总开关**；`false` 真正关掉签到（**猫猫旅行随之停摆**，见下） |
+| `schedule.keepalive_enabled` | `true` | token 保活总开关；`false` 关掉保活 |
 | `upstream.timeout_seconds` | `120` | 短 RPC（刷新/签到/余额/模型）总时长上限 |
 | `upstream.header_timeout_seconds` | 回落 `timeout_seconds` | 聊天首字节前（响应头）上限 |
 | `upstream.idle_timeout_seconds` | `300` | 聊天流中空闲上限（活跃续命，静默断流） |
@@ -224,7 +233,7 @@ curl -s http://localhost:7863/v1/chat/completions \
 
 加载顺序：JSON 文件 → `WB2A_*` 环境变量（变量非空才覆盖）：
 
-`WB2A_LISTEN` · `WB2A_API_KEY` · `WB2A_AUTH_DIR` · `WB2A_STATE_FILE` · `WB2A_SOFT_RATE`（duration） · `WB2A_TIMEOUT_SECONDS` · `WB2A_HEADER_TIMEOUT_SECONDS` · `WB2A_IDLE_TIMEOUT_SECONDS` · `WB2A_SANITIZE_FINGERPRINTS`（bool）
+`WB2A_LISTEN` · `WB2A_API_KEY` · `WB2A_AUTH_DIR` · `WB2A_STATE_FILE` · `WB2A_SOFT_RATE`（duration） · `WB2A_SOFT_RATE_MAX`（duration） · `WB2A_TIMEOUT_SECONDS` · `WB2A_HEADER_TIMEOUT_SECONDS` · `WB2A_IDLE_TIMEOUT_SECONDS` · `WB2A_SANITIZE_FINGERPRINTS`（bool）
 
 ## 🧠 账号池与流量治理
 
@@ -252,13 +261,15 @@ curl -s http://localhost:7863/v1/chat/completions \
 | 分类 | 触发条件 | 账号处置 | 恢复 |
 |---|---|---|---|
 | 余额不足 | HTTP 402 / body 含余额关键词 | 硬冷却到**次日 04:00**（本地时区） | 签到（09/21 点）余额恢复自动解冻 |
-| 频控 | HTTP 429 | 软冷却 `soft_rate`（60s） | 到期自动恢复 |
+| 频控 | HTTP 429 / 限流文案（不限状态码） | 软冷却 `soft_rate`（600s 起，连续触发指数退避，封顶 `soft_rate_max`） | 到期自动恢复 / 成功清零退避 |
 | Session 失效 | body 含 `Offline user session not found` / `12153` | **永久禁用** | 人工重新登录 |
-| 上游 404 | HTTP 404 | 软冷却（60s） | 到期自动恢复 |
+| 上游 404 | HTTP 404 | 软冷却固定 60s（不随 `soft_rate`、不单独退避） | 到期自动恢复 |
 | 服务端错误 | HTTP ≥500 | 喂连续失败计数，达阈值熔断 | 熔断到期 / 成功清零 |
 | 客户端错误 | 其余 4xx / 业务 `code≠0` | 不处罚，换号重试 | 即时 |
 
 **熔断器**：所有冷却入口（429/404/402）与 5xx 共用唯一连续失败计数器 `fails`；累计达 `breaker_threshold`（默认 3）触发熔断，退避 `breaker_cooldown × 2^retryCount`，封顶 `6h`；成功清零。
+
+**软冷却指数退避**（与熔断器并存的第二条升级线）：软限流的**冷却时长**本身也按连续次数退避——同一账号连续触发软冷却时 `soft_rate × 2^(连续次数-1)`，封顶 `soft_rate_max`。计数 `soft_streak` 独立于熔断器的 `fails`，只在**成功**或**签到解冻**时清零，随 `state.json` 持久化。两者别混淆：软退避管"近期被限流"（600s→1200s→2400s…，分钟~小时级），熔断管"病态反复失败"（30m→1h→2h→6h）。
 
 ### 选号策略
 
@@ -281,12 +292,73 @@ curl -s http://localhost:7863/v1/chat/completions \
 
 ### 定时任务
 
-| 任务 | 时刻（本地时区） | 行为 |
-|---|---|---|
-| 签到 | `checkin_hours` 默认 `[9, 21]` 整点 | 签到 + 余额查询；余额恢复则解冻冷却账号 |
-| 保活 | `keepalive_hours` 默认 `[22]` 整点 | 全账号刷新 token；session 失效自动禁用 |
+| 任务 | 开关 | 时刻（本地时区） | 行为 |
+|---|---|---|---|
+| 签到 | `schedule.checkin_enabled` 默认 `true` | `checkin_hours` 默认 `[9, 21]` 整点 | 签到 + 余额查询；余额恢复则解冻冷却账号；**收尾顺带跑一趟猫猫旅行** |
+| 保活 | `schedule.keepalive_enabled` 默认 `true` | `keepalive_hours` 默认 `[22]` 整点 | 全账号刷新 token；session 失效自动禁用 |
 
 容器时区由 `TZ` 控制（compose 默认 `Asia/Shanghai`）。
+
+#### 关闭定时任务
+
+用 `schedule.checkin_enabled` / `schedule.keepalive_enabled` 显式关闭，两者互相独立：
+
+```json
+"schedule": {
+  "checkin_hours": [9, 21],
+  "keepalive_hours": [22],
+  "checkin_enabled": false,
+  "keepalive_enabled": true
+}
+```
+
+上例：**只关签到，保活照常 22:00 跑**。两个都设 `false` 则调度器无任何时点可等，
+`Run` 不空转、直接阻塞等待退出信号（不会忙等空烧 CPU）。
+
+几条必须知道的语义：
+
+- **为什么用独立开关，而不是把小时数组留空**：空数组与 `null` 在本项目里一贯表示
+  **「未配置 → 回落默认」**（`[9, 21]` / `[22]`），不是「禁用」。沿用该语义可保证
+  老 config 行为逐字不变；真正关闭请用 `*_enabled: false`。
+- **关签到 = 猫猫旅行也停**：旅行没有独立开关，它搭签到时点便车执行（见下节）。
+  想让旅行继续跑就不能关签到——如需保留旅行请把 `checkin_hours` 调成你想要的时点。
+- **禁用不会擦除小时配置**：`checkin_hours` 原样保留，改回 `true` 即恢复原时点，无需补配。
+- **小时值必须是 0-23**：写了 `-1`、`25` 之类的非法值会在启动时**直接报错**并提示改用
+  开关（不做静默兜底，避免你以为关掉了、实际却在别的整点照常执行）。
+- 开关只影响**本进程的定时排程**，不改变池内冷却/熔断/禁用等既有状态机行为；
+  独立的一次性工具（`signin.sh` / `cmd/signin`）是另一个进程，不受本开关约束。
+- **关签到的连带影响**：签到的余额查询会「余额恢复即解冻」被硬冷却的账号（402 余额不足），
+  关掉后这类账号只能等硬冷却**次日 04:00 自然到期**才回到池中——当日余额回补不再提前解冻。
+
+#### 猫猫旅行（随签到时点合并执行）
+
+对池内每个可用账号在**签到时点（`checkin_hours`，默认 9/21 点）单趟推进一次**，
+每趟只做一个动作，不轮询不等待：
+
+**为什么不再单独排程**：每日上限按「派出」计 1 次/天，奖励在派出时即锁定、晚领不丢分；
+旅行周期以小时计，30 分钟粒度的额外巡检不会多派一次，只是白白增加上游请求。
+合并到签到时点后每账号每天 2 趟，签到 → 派猫 → 领奖一次跑完。
+（签到排在旅行之前：先签到解冻冷却账号，本轮旅行才能覆盖到它们。）
+
+| 探测结果 | 动作 |
+|---|---|
+| 无猫（`buddy` 为 `null`） | 先同意协议（幂等），再尝试领养；过门槛则 +300 积分并获得猫 |
+| `state=idle` 且今日未派出 | 派出 `location_id=4`（古镇客栈；4 个地点收益/时长区间相同，无最优解） |
+| `state=arrived` | 领取到站奖励（带 `record_id`） |
+| `state=traveling` / 今日已达上限 / 未知状态 | 跳过 |
+
+- **领养门槛**：conversation 门槛未达标时上游返回 HTTP 400 `first_buddy task not completed yet`，
+  属预期行为——**每账号每自然日只尝试一次**，失败后当日静默跳过，跨日（00:00 CST）自动重试；
+  记录仅存内存，进程重启后清零。
+- **限速**：账号间间隔 800ms（46 个账号约 40s），避免触发上游风控。
+- **每自然日 1 次派出**：按 CST（Asia/Shanghai）自然日重置，与容器 `TZ` 无关。
+- **失败隔离**：单个账号查询/动作失败只跳过该账号本轮，不中断其他账号；401 不做强刷
+  （token 刷新交 22:00 保活），失败信息按 `travel <uid>: <动作>: <错误>` 落日志。
+- **关闭**：旅行无独立开关——它随签到一起跑，不再单独排程。
+  因此 **`schedule.checkin_enabled: false` 关掉签到的同时，旅行也一并停摆**；
+  只想调整时点（而非关闭）请改 `checkin_hours`。
+
+签到与保活配到同一小时（如都含 22 点）时，两类任务都会执行。
 
 ## 🔌 API 端点
 
@@ -295,9 +367,54 @@ curl -s http://localhost:7863/v1/chat/completions \
 | `POST /v1/chat/completions` | Bearer（`api_key` 非空时） | OpenAI 兼容补全；流式/非流式；请求体上限 8 MiB |
 | `GET /v1/models` | Bearer（`api_key` 非空时） | 模型列表（动态拉取，缓存 1h；失败回落静态表 + 5min 负缓存） |
 | `GET /status` | Bearer（`api_key` 非空时） | 账号状态汇总 + 每账号详情（积分/冷却/熔断/在途/粘性） |
-| `GET /healthz` | 无 | 健康检查：有 healthy 且未占满账号返回 200，否则 503 |
+| `GET /healthz` | 无 | 健康检查：有 healthy 且未占满账号返回 200，否则 503；响应带身份标识（见下） |
 
 > 鉴权规则：仅当 `api_key` 非空才校验 `Authorization: Bearer <api_key>`；**`api_key` 为空时上述端点直接放行**；`/healthz` 恒无鉴权。
+
+`/healthz` 响应示例（200/503 同结构，仅状态码与计数变化）：
+
+```json
+{"healthy": 2, "total": 3, "service": "workbuddy2api"}
+```
+
+响应同时带 `X-Service: workbuddy2api` 头。这两个身份标识用于区分**本网关**与同端口上
+可能残留的其他服务——后者即使返回 2xx 也不会带该字段/头，宿主探测据此避免"假成功"。
+
+### 宿主健康探测指引
+
+宿主程序（如 workbuddy-switch 托管网关子进程）探活时，**"端口通 + 返回 2xx" 不足以
+证明打到了自己的网关**：同端口可能残留旧版本进程或别的服务，对方返回 2xx 会造成假成功。
+按校验强度从高到低有两种做法：
+
+**① 强校验（推荐）：`/status` + `api_key`**
+
+```bash
+# 期望 200；若返回 401 则说明对面的 /status 不认这个 api_key —— 不是自己的网关
+curl -s -o /dev/null -w '%{http_code}\n' \
+  -H "Authorization: Bearer <api_key>" \
+  http://127.0.0.1:7863/status
+```
+
+`/status` 挂在鉴权中间件上：只有持有正确 `api_key` 的本网关才会返回 200，旧服务/其他服务
+只会返回 401（或 404）。**注意前提**：本网关 `api_key` 非空才具备这个判别力；
+`api_key` 为空时 `/status` 直接放行，退化为弱校验。
+
+宿主判定建议：`200` → 健康；`401` → 不是自己的网关（端口被占）；连接失败 → 未就绪；
+`5xx` → 网关已就位但池不可服务（可再叠加 `/healthz` 的 503 语义）。
+
+**② 弱校验（无凭据场景）：`/healthz` + `service` 字段**
+
+```bash
+# 必须同时校验 service 字段；只判断 HTTP 状态码仍可能假成功
+curl -s http://127.0.0.1:7863/healthz | grep -q '"service":"workbuddy2api"'
+```
+
+适合负载均衡器 / 容器编排这类**不该持有 api_key** 的探活方（`/healthz` 恒无鉴权，
+200=可服务、503=池内无可服务账号）。判据是响应体 `service == "workbuddy2api"`；
+响应头 `X-Service` 可用于只读头部的探活实现。若对面返回 2xx 但缺该标识 → 判为异常。
+
+> 容器自带的 `HEALTHCHECK` 用的就是 ②（仅进程内自检，够用）；
+> 宿主做**跨进程归属确认**时用 ①。
 
 ### 流式行为细节
 
@@ -361,6 +478,8 @@ curl -s http://localhost:7863/v1/chat/completions \
 | `/v2/plugin/auth/state?platform=CLI` | POST | `copilot.tencent.com` | OAuth 取授权 URL |
 | `/v2/plugin/auth/token?state=` | GET | 同上 | OAuth 轮询取 token |
 | `/v2/plugin/login/account?state=` | GET | 同上 | OAuth 取账号信息 |
+| `/activity/growth/buddy/agreement` `first` `info` | POST/GET | 同上 | 猫猫旅行：同意协议 / 首次领养 / 查询 |
+| `/activity/growth/buddy/travel/status` `depart` `claim` | GET/POST | 同上 | 猫猫旅行：状态 / 派出 / 领奖（随签到时点执行） |
 
 > 上述 `/v2/*` 端点是 CodeBuddy 官方 CLI/插件使用的接口，**未见公开 API 文档，属非公开/逆向接口**；本项目不主张任何上游接口的官方授权或稳定性承诺。出站统一携带 `CLI/2.63.2 CodeBuddy/2.63.2` UA；聊天请求带账号头（`X-User-Id` 等），**永不携带 `X-Refresh-Token`**。
 
@@ -410,7 +529,7 @@ cmd/
 internal/
   auth/      # 凭证解析 + token 刷新 + 原子写回
   pool/      # 账号池（状态机/熔断/租约/加权/持久化）
-  scheduler/ # 定时签到 + 保活
+  scheduler/ # 定时签到 + 保活 + 猫猫旅行巡检
   server/    # HTTP handler + 鉴权 + 请求日志
   session/   # 会话粘性路由
   upstream/  # 上游封装（chat/billing/auth/headers/sse/payload/sanitize/idle）
@@ -423,4 +542,8 @@ internal/
 
 ## License
 
-本仓库未包含 LICENSE 文件。如需使用或再分发，请向仓库所有者确认授权条款。
+本项目采用 [MIT License](LICENSE) 开源协议。
+
+- 允许任意使用、复制、修改、合并、发布、分发、再授权及销售
+- 再分发（源码或二进制形式，包括内嵌编译产物的整合项目）时，请保留原仓库的 MIT 版权声明与许可声明（如在 NOTICE 或 README 中注明原始出处 `https://github.com/Sliverkiss/workbuddy2api`，我们将不胜感激）
+- 本项目不授予任何上游（CodeBuddy / 腾讯）接口或服务的权利；使用者仍需自行遵守上游服务条款（见上方免责声明）

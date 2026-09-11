@@ -193,6 +193,150 @@ func TestChatRotatesOnHardCredit(t *testing.T) {
 	}
 }
 
+// TestChatSoftCoolsOnRateLimitBody 端到端回归 issue #28：上游用非 429 状态码
+// （400 + 限流文案）表达模型侧限流时，该账号必须进入 CoolSoft 冷却，而不是只换号。
+// 修复前 Classify 归 ErrClient → applyErrorPolicy 走 default 分支只换号不罚，
+// 账号留在可用池里，下一个请求仍会被选中。
+func TestChatSoftCoolsOnRateLimitBody(t *testing.T) {
+	calls := map[string]int{}
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		calls[authz]++
+		if authz == "Bearer at-bad" {
+			return 400, `{"code":1,"msg":"The model provider is rate-limiting requests. Please wait a moment and try again."}`, false
+		}
+		return 200, sseOK, true
+	})
+	p := testPoolWith(
+		&auth.Auth{UID: "bad", AccessToken: "at-bad", ExpiresAt: 9999999999},
+		&auth.Auth{UID: "good", AccessToken: "at-good", ExpiresAt: 9999999999},
+	)
+	// 让 bad 积分更高被先选中（与 TestChatRotatesOnHardCredit 同一确定性手法）。
+	p.SetCredits("bad", 2000)
+	p.SetCredits("good", 1000)
+	const soft = 45 * time.Second
+	h := NewHandler(Config{Pool: p, Upstream: up, SoftCooldown: soft})
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[]}`)))
+	if rec.Code != 200 {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+	if calls["Bearer at-bad"] != 1 || calls["Bearer at-good"] != 1 {
+		t.Errorf("calls=%v want bad/good 各 1 次", calls)
+	}
+	st, _ := p.Status("bad")
+	if !st.Cooling || st.CoolKind != "soft_rate" {
+		t.Fatalf("bad 应进入 soft_rate 冷却: %+v", st)
+	}
+	// 冷却时长取自注入的 SoftCooldown，不依赖真实等待。
+	if max := int64(soft / time.Second); st.CoolRemaining <= 0 || st.CoolRemaining > max {
+		t.Errorf("cool_remaining_sec=%d want in (0,%d]", st.CoolRemaining, max)
+	}
+
+	// 冷却生效：同一账号在冷却期内不得再被选中。
+	before := calls["Bearer at-bad"]
+	rec2 := httptest.NewRecorder()
+	h.ServeHTTP(rec2, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[]}`)))
+	if rec2.Code != 200 {
+		t.Fatalf("second code=%d body=%s", rec2.Code, rec2.Body)
+	}
+	if calls["Bearer at-bad"] != before {
+		t.Errorf("冷却中的账号不应再次被选中: calls=%v", calls)
+	}
+}
+
+// TestApplyErrorPolicySoftRateExponentialBackoff handler 层回归：同一账号连续被限流，
+// 冷却时长必须 600s → 1200s → 2400s 指数增长（时长断言全部取自注入值，不依赖真实等待）。
+// 直接驱动 applyErrorPolicy 而非发 HTTP 请求：账号在冷却期内不会被再次选中，
+// 走完整请求会需要等冷却自然到期（真实 sleep），而这里要验的正是"连续限流"的退避本身。
+// Classify→applyErrorPolicy 的接线由 TestChatSoftCoolsOnRateLimitBody 端到端覆盖。
+func TestApplyErrorPolicySoftRateExponentialBackoff(t *testing.T) {
+	p := pool.New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	h := NewHandler(Config{Pool: p, SoftCooldown: 600 * time.Second})
+
+	for i, want := range []int64{600, 1200, 2400} {
+		h.applyErrorPolicy("u1", upstream.ErrSoftRate)
+		st, _ := p.Status("u1")
+		if !st.Cooling || st.CoolKind != "soft_rate" {
+			t.Fatalf("call %d: 应为 soft_rate 冷却: %+v", i+1, st)
+		}
+		if st.SoftStreak != i+1 {
+			t.Errorf("call %d: soft_streak=%d want %d", i+1, st.SoftStreak, i+1)
+		}
+		if st.CoolRemaining < want-3 || st.CoolRemaining > want {
+			t.Errorf("call %d: cool_remaining_sec=%d want ~%d", i+1, st.CoolRemaining, want)
+		}
+	}
+}
+
+// TestApplyErrorPolicyNotFoundUsesFixedBase 404 分流：偶发上游 404 的冷却基数固定 60s
+// （notFoundCooldown），不取 soft_rate 的 600s 基数，也不受其配置值影响。
+//
+// 关于退避：404 仍走 Cooldown(CoolSoft)，因此与 429 共用同一 softStreak（本用例锚定这一
+// 现状）。这不构成"偶发 404 罚过重"的场景——streak 只在**连续**无成功时累积，
+// 中间任何一次成功（NoteSuccess）都会把它清零；故只有持续 404 的坏号才会退避升级。
+func TestApplyErrorPolicyNotFoundUsesFixedBase(t *testing.T) {
+	p := pool.New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	h := NewHandler(Config{Pool: p, SoftCooldown: 20 * time.Minute}) // soft_rate 配得很大，验证 404 不受其影响
+
+	notFoundSec := int64(notFoundCooldown / time.Second)
+	for i, want := range []int64{notFoundSec, 2 * notFoundSec, 4 * notFoundSec} {
+		h.applyErrorPolicy("u1", upstream.ErrNotFound)
+		st, _ := p.Status("u1")
+		if !st.Cooling || st.CoolKind != "soft_rate" {
+			t.Fatalf("call %d: 应为 soft 冷却: %+v", i+1, st)
+		}
+		if st.SoftStreak != i+1 {
+			t.Errorf("call %d: soft_streak=%d want %d", i+1, st.SoftStreak, i+1)
+		}
+		// 基数取自 notFoundCooldown（60s）而非注入的 soft_rate（20m）。
+		if st.CoolRemaining < want-3 || st.CoolRemaining > want {
+			t.Errorf("call %d: 404 cool_remaining_sec=%d want ~%d（固定基数 %ds，非 soft_rate）",
+				i+1, st.CoolRemaining, want, notFoundSec)
+		}
+	}
+
+	// 成功后 streak 归零 → 下次 404 回到 60s 基数。
+	// （签到解冻 ReenableIfCredits 不适用于本场景：它保留 streak，是冷却域的续期。）
+	p.NoteSuccess("u1")
+	h.applyErrorPolicy("u1", upstream.ErrNotFound)
+	if st, _ := p.Status("u1"); st.SoftStreak != 1 || st.CoolRemaining > notFoundSec {
+		t.Errorf("success should reset 404 backoff: %+v", st)
+	}
+}
+
+// TestNewHandlerSoftCooldownDefault 端到端：未注入 SoftCooldown 时基数回落到 600s（原为 60s）。
+func TestNewHandlerSoftCooldownDefault(t *testing.T) {
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		if authz == "Bearer at-bad" {
+			return 429, `{"code":1,"msg":"rate limit"}`, false
+		}
+		return 200, sseOK, true
+	})
+	p := testPoolWith(
+		&auth.Auth{UID: "bad", AccessToken: "at-bad", ExpiresAt: 9999999999},
+		&auth.Auth{UID: "good", AccessToken: "at-good", ExpiresAt: 9999999999},
+	)
+	p.SetCredits("bad", 2000)
+	p.SetCredits("good", 1000)
+	h := NewHandler(Config{Pool: p, Upstream: up}) // 不注入 SoftCooldown
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[]}`)))
+	if rec.Code != 200 {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+	st, _ := p.Status("bad")
+	if !st.Cooling || st.CoolKind != "soft_rate" {
+		t.Fatalf("bad 应进入 soft_rate 冷却: %+v", st)
+	}
+	if st.CoolRemaining <= 599 || st.CoolRemaining > 600 {
+		t.Errorf("default soft cooldown cool_remaining_sec=%d want 600", st.CoolRemaining)
+	}
+}
+
 // TestChatStickyFollowsFinalSuccess 端到端验证 D4：粘性号失败换号成功后，会话绑定收敛到成功号。
 func TestChatStickyFollowsFinalSuccess(t *testing.T) {
 	st := newBindStore()
@@ -328,8 +472,9 @@ func TestChatHardCreditCooldownUntilNextDay4AM(t *testing.T) {
 	if st.Until.Hour() != 4 {
 		t.Errorf("until hour=%d want 4 (next-day 04:00)", st.Until.Hour())
 	}
-	if d := time.Until(st.Until); d <= 0 || d > 24*time.Hour {
-		t.Errorf("until %v not within (0,24h]: %v", st.Until, d)
+	// 距次日 04:00 最长 28h（凌晨 00:00~04:00 间运行时 now→次日 04:00 跨度 > 24h，属正常）。
+	if d := time.Until(st.Until); d <= 0 || d > 28*time.Hour {
+		t.Errorf("until %v not within (0,28h]: %v", st.Until, d)
 	}
 	// 立即换号成功：good 被选中。
 	stGood, _ := p.Status("good")
@@ -839,6 +984,60 @@ func TestHealthz200WithHealthy(t *testing.T) {
 	}
 	if resp["healthy"] != float64(1) || resp["total"] != float64(1) {
 		t.Errorf("healthz json=%v want healthy=1 total=1", resp)
+	}
+}
+
+// TestHealthzServiceIdentity /healthz 无论 200 还是 503 都必须带网关身份标识
+// （响应体 service 字段 + X-Service 头）：宿主探测打到同端口的旧服务/其他服务时，
+// 对方即使返回 2xx 也不带本标识，宿主据此判"假成功"。
+func TestHealthzServiceIdentity(t *testing.T) {
+	cases := []struct {
+		name     string
+		setup    func(*pool.Pool)
+		wantCode int
+	}{
+		{"healthy", func(*pool.Pool) {}, http.StatusOK},
+		{"unhealthy", func(p *pool.Pool) { p.Disable("u1", "session dead") }, http.StatusServiceUnavailable},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at", ExpiresAt: 9999999999})
+			tc.setup(p)
+			h := NewHandler(Config{Pool: p, Upstream: upstream.New()})
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, httptest.NewRequest("GET", "/healthz", nil))
+			if rec.Code != tc.wantCode {
+				t.Fatalf("code=%d want %d", rec.Code, tc.wantCode)
+			}
+			if got := rec.Header().Get("X-Service"); got != ServiceName {
+				t.Errorf("X-Service=%q want %q", got, ServiceName)
+			}
+			var resp map[string]any
+			if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+				t.Fatalf("healthz not json: %v body=%s", err, rec.Body)
+			}
+			if resp["service"] != ServiceName {
+				t.Errorf("service=%v want %q", resp["service"], ServiceName)
+			}
+		})
+	}
+}
+
+// TestHealthzServiceIdentityWithoutAuth /healthz 保持无鉴权（负载均衡友好）：
+// 配了 api_key 也不要求 Bearer，身份字段照常返回。
+func TestHealthzServiceIdentityWithoutAuth(t *testing.T) {
+	h := NewHandler(Config{
+		Pool:     testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at", ExpiresAt: 9999999999}),
+		Upstream: upstream.New(),
+		APIKey:   "secret",
+	})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("GET", "/healthz", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("healthz must stay unauthenticated: code=%d", rec.Code)
+	}
+	if got := rec.Header().Get("X-Service"); got != ServiceName {
+		t.Errorf("X-Service=%q want %q", got, ServiceName)
 	}
 }
 
