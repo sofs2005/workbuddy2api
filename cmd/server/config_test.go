@@ -568,17 +568,17 @@ func TestMaxBodyEnvOverride(t *testing.T) {
 	}
 }
 
-// TestPromptDefaultCustom 默认 prompt.mode=custom 且 PromptText 为内置默认（非空）。
-func TestPromptDefaultCustom(t *testing.T) {
+// TestPromptDefaultMode 默认 prompt.mode=passthrough 且不加载 PromptText（透传客户端原始 system）。
+func TestPromptDefaultMode(t *testing.T) {
 	c, err := Load("")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c.Prompt.Mode != "custom" {
-		t.Errorf("prompt.mode=%q want custom", c.Prompt.Mode)
+	if c.Prompt.Mode != "passthrough" {
+		t.Errorf("prompt.mode=%q want passthrough", c.Prompt.Mode)
 	}
-	if c.PromptText == "" {
-		t.Error("PromptText should be non-empty (built-in default)")
+	if c.PromptText != "" {
+		t.Errorf("default passthrough should not load PromptText, got len=%d", len(c.PromptText))
 	}
 }
 
@@ -626,7 +626,9 @@ func TestPromptFileOverride(t *testing.T) {
 	want := "我的自定义人格入口"
 	os.WriteFile(pf, []byte(want), 0o600)
 	cf := filepath.Join(dir, "c.json")
-	os.WriteFile(cf, []byte(`{"prompt":{"mode":"custom","file":"`+pf+`"}}`), 0o600)
+	// 路径写进 JSON 字符串需转义反斜杠：Windows 下 filepath.Join 生成 C:\Users\...，
+	// 原样拼接会让 \U 成为非法 JSON 转义。ToSlash 统一为正斜杠（跨平台可解析）。
+	os.WriteFile(cf, []byte(`{"prompt":{"mode":"custom","file":"`+filepath.ToSlash(pf)+`"}}`), 0o600)
 	c, err := Load(cf)
 	if err != nil {
 		t.Fatal(err)
@@ -648,7 +650,7 @@ func TestPromptEnvOverride(t *testing.T) {
 	}
 }
 
-// TestPromptLegacyConfigNoImpact 旧 config（无 prompt 段）零影响：mode 仍 custom。
+// TestPromptLegacyConfigNoImpact 旧 config（无 prompt 段）零影响：mode 走缺省 passthrough。
 func TestPromptLegacyConfigNoImpact(t *testing.T) {
 	dir := t.TempDir()
 	fp := filepath.Join(dir, "c.json")
@@ -657,8 +659,8 @@ func TestPromptLegacyConfigNoImpact(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c.Prompt.Mode != "custom" {
-		t.Errorf("legacy config should default to custom, got %q", c.Prompt.Mode)
+	if c.Prompt.Mode != "passthrough" {
+		t.Errorf("legacy config should default to passthrough, got %q", c.Prompt.Mode)
 	}
 	if c.Listen != ":9999" {
 		t.Errorf("listen=%q", c.Listen)
