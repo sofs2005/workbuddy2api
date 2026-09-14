@@ -54,13 +54,16 @@ func (s *chatStat) done() {
 // 并记录首个 data 帧的 TTFB；原始字节原样返回给下游透传。
 // 注意：不做 rune 估算，token 数一律采信上游 usage。
 type chatStatsReader struct {
-	br       *bufio.Reader
-	start    time.Time
-	ttfb     time.Duration
-	seen     bool // 已见过首个 data 帧（TTFB 只记一次）
-	hasUsage bool // 末帧是否带 usage
-	tokens   int
-	pend     []byte // 已读未返回的行缓存
+	br        *bufio.Reader
+	start     time.Time
+	ttfb      time.Duration
+	seen      bool // 已见过首个 data 帧（TTFB 只记一次）
+	hasUsage  bool // 末帧是否带 usage
+	hasCredit bool // 是否出现过带 credit 的 usage（缺失≠0，见 Credit() 注释）
+	tokens    int
+	credit    float64 // 末帧 usage.credit（本次真实扣费，供成本账本）
+	prompt    int     // 末帧 usage.prompt_tokens（与 completion 合计折算单价）
+	pend      []byte  // 已读未返回的行缓存
 }
 
 // newChatStatsReaderSince 以 since 为 TTFB 计时起点（通常是请求进入 handler 的时刻）。
@@ -73,6 +76,14 @@ func (s *chatStatsReader) TTFB() time.Duration { return s.ttfb }
 
 // Tokens 返回末帧 usage.completion_tokens 与是否缺失；无 usage 时 ok=false。
 func (s *chatStatsReader) Tokens() (int, bool) { return s.tokens, s.hasUsage }
+
+// Credit 返回末帧 usage.credit（本次真实扣费）。ok=true 要求 usage 存在**且** credit
+// 字段显式出现——字段缺失时 ok=false（缺失≠0：不能把"缺观测"当"0 成本"写入账本，
+// 否则收费的号可能被误判 tier0 免费层）。显式 credit:0 仍是合法免费观测（ok=true）。
+func (s *chatStatsReader) Credit() (float64, bool) { return s.credit, s.hasUsage && s.hasCredit }
+
+// TotalTokens 返回本次请求总 token 数（prompt + completion），供成本单价折算。
+func (s *chatStatsReader) TotalTokens() int { return s.prompt + s.tokens }
 
 // parseSSELine 解析一行 "data: {...}"：首帧记 TTFB，含 usage 时采信精确 completion_tokens。
 func (s *chatStatsReader) parseSSELine(line string) {
@@ -90,7 +101,9 @@ func (s *chatStatsReader) parseSSELine(line string) {
 	}
 	var chunk struct {
 		Usage *struct {
-			CompletionTokens int `json:"completion_tokens"`
+			CompletionTokens int      `json:"completion_tokens"`
+			PromptTokens     int      `json:"prompt_tokens"`
+			Credit           *float64 `json:"credit"` // 指针区分「缺失」与「显式 0」
 		} `json:"usage"`
 	}
 	if json.Unmarshal([]byte(payload), &chunk) != nil || chunk.Usage == nil {
@@ -98,6 +111,11 @@ func (s *chatStatsReader) parseSSELine(line string) {
 	}
 	s.hasUsage = true
 	s.tokens = chunk.Usage.CompletionTokens
+	s.prompt = chunk.Usage.PromptTokens
+	if chunk.Usage.Credit != nil {
+		s.hasCredit = true
+		s.credit = *chunk.Usage.Credit
+	}
 }
 
 // Read 返回原始数据，同时解析统计 TTFB/token。
@@ -140,6 +158,22 @@ func completionTokens(resp map[string]any) int {
 		return -1
 	}
 	return int(v)
+}
+
+// usageCreditTotal 从聚合响应提取本次真实扣费与总 token 数（供成本账本）。
+// ok=false 表示 usage 缺失或字段类型不符——此时不记录观测，避免污染账本。
+func usageCreditTotal(resp map[string]any) (credit float64, total int, ok bool) {
+	u, isMap := resp["usage"].(map[string]any)
+	if !isMap {
+		return 0, 0, false
+	}
+	c, hasCredit := u["credit"].(float64)
+	pt, hasPrompt := u["prompt_tokens"].(float64)
+	ct, hasCompletion := u["completion_tokens"].(float64)
+	if !hasCredit || (!hasPrompt && !hasCompletion) {
+		return 0, 0, false
+	}
+	return c, int(pt) + int(ct), true
 }
 
 // uidPrefix 只显示 uid 前 8 位；空 uid 显示 "-"。

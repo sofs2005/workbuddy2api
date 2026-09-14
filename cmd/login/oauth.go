@@ -1,7 +1,10 @@
-// oauth.go — OAuth 设备流的三个原子步骤（url / poll / 端点常量）。
+// oauth.go — WorkBuddy OAuth 设备流的端点与 HTTP 层（按 realm 切换端点/来源头）。
 //
-// 与 /root/qoderwork/workbuddy/oauth.go 的 handleStartLogin + handlePollLogin
-// 逐字一致的实现，CN realm only。
+// 与 main.go 的分工：本文件只负责「跟上游说话」（常量、请求头、信封解析、取
+// 授权 URL、换 token），main.go 负责 CLI 层（参数解析、子命令分发、交互式单命令流程）。
+//
+// 无 PKCE（workbuddy 设备流由服务端签发 state）。端点 URL 由 realmConfig（main.go）
+// 按 realm 拼出后作为 base 传入本文件的函数，故此处不再硬编码端点。
 package main
 
 import (
@@ -14,40 +17,44 @@ import (
 	"time"
 )
 
-// 与 /root/qoderwork/workbuddy/main.go:82-96 完全一致的常量（CN only）
+// 上游常量：CN → copilot.tencent.com（Origin 为 codebuddy.cn）；global → www.workbuddy.ai
+// （base 与 Origin/Referer 同域）。base 由 realmConfig 按 realm 选，origin 随之配套。
 const (
-	upstreamBaseCN    = "https://copilot.tencent.com"
-	clientUA          = "CLI/2.63.2 CodeBuddy/2.63.2"
-	originReferer     = "https://www.codebuddy.cn"
-	endpointAuthState = upstreamBaseCN + "/v2/plugin/auth/state?platform=CLI"
-	endpointLoginAcct = upstreamBaseCN + "/v2/plugin/login/account?state="
-	endpointAuthToken = upstreamBaseCN + "/v2/plugin/auth/token?state="
+	upstreamBaseCN      = "https://copilot.tencent.com"
+	upstreamBaseGlobal  = "https://www.workbuddy.ai"
+	clientUA            = "CLI/2.63.2 CodeBuddy/2.63.2"
+	originRefererCN     = "https://www.codebuddy.cn"
+	originRefererGlobal = "https://www.workbuddy.ai"
 )
 
-// newLoginClient 每个流程独立 cookie jar（oauth.go:22-29：多账号登录互不串会话）
+// newLoginClient 每个流程独立 cookie jar（多账号登录互不串会话）。
 func newLoginClient() *http.Client {
 	jar, _ := cookiejar.New(nil)
 	return &http.Client{Timeout: 30 * time.Second, Jar: jar}
 }
 
-// commonHeaders 与 main.go:496-503 一致
-func commonHeaders(req *http.Request) {
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "application/json, text/plain, */*")
-	req.Header.Set("X-Requested-With", "XMLHttpRequest")
-	req.Header.Set("Origin", originReferer)
-	req.Header.Set("Referer", originReferer+"/")
-	req.Header.Set("User-Agent", clientUA)
+// commonHeaders 按 origin 设置通用请求头（Origin/Referer 随 realm 变化）。
+// 返回 func(*http.Request)，由调用方按 realm 选定的 origin 构造一次后复用。
+func commonHeaders(origin string) func(*http.Request) {
+	return func(req *http.Request) {
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Accept", "application/json, text/plain, */*")
+		req.Header.Set("X-Requested-With", "XMLHttpRequest")
+		req.Header.Set("Origin", origin)
+		req.Header.Set("Referer", origin+"/")
+		req.Header.Set("User-Agent", clientUA)
+	}
 }
 
-// apiEnvelope 与 main.go:429-433 一致
+// apiEnvelope {code,msg,data} 信封（上游全部业务端点统一形状）。
 type apiEnvelope struct {
 	Code int             `json:"code"`
 	Msg  string          `json:"msg"`
 	Data json.RawMessage `json:"data"`
 }
 
-// doJSON 与 oauth.go:33-66 一致：{code,msg,data} 信封，code!=0 → error
+// doJSON 发一次请求并拆 {code,msg,data} 信封：HTTP >=400、重定向、信封解析失败、
+// code!=0 均归为 error（返回的 status 供调用方区分网络层/业务层）。
 func doJSON(client *http.Client, method, fullURL string, headers func(*http.Request), body io.Reader) (json.RawMessage, int, error) {
 	req, err := http.NewRequest(method, fullURL, body)
 	if err != nil {
@@ -56,7 +63,8 @@ func doJSON(client *http.Client, method, fullURL string, headers func(*http.Requ
 	if headers != nil {
 		headers(req)
 	} else {
-		commonHeaders(req)
+		// 缺省头：CN origin（零回归）
+		commonHeaders(originRefererCN)(req)
 	}
 	resp, err := client.Do(req)
 	if err != nil {
@@ -80,9 +88,51 @@ func doJSON(client *http.Client, method, fullURL string, headers func(*http.Requ
 	return env.Data, resp.StatusCode, nil
 }
 
-// startAuth 发起授权（handleStartLogin, oauth.go:68-87），返回授权 URL 与 state
-func startAuth(client *http.Client) (authURL, state string, err error) {
-	data, _, err := doJSON(client, http.MethodPost, endpointAuthState, nil, bytes.NewReader([]byte("{}")))
+// tokenBundle 登录凭证 + 账号信息（换 token 后的聚合结果）。
+type tokenBundle struct {
+	AccessToken  string
+	RefreshToken string
+	ExpiresIn    int64
+	Domain       string
+	UID          string
+	EnterpriseID string
+	Nickname     string
+}
+
+// tokenFields 把 tokenBundle 投影为 buildLoginOutput 的 token 参数
+// （buildLoginOutput 用匿名 struct 定形，需逐字对齐字段与 tag）。
+func (tb tokenBundle) tokenFields() struct {
+	AccessToken  string `json:"accessToken"`
+	RefreshToken string `json:"refreshToken"`
+	ExpiresIn    int64  `json:"expiresIn"`
+	Domain       string `json:"domain"`
+} {
+	return struct {
+		AccessToken  string `json:"accessToken"`
+		RefreshToken string `json:"refreshToken"`
+		ExpiresIn    int64  `json:"expiresIn"`
+		Domain       string `json:"domain"`
+	}{tb.AccessToken, tb.RefreshToken, tb.ExpiresIn, tb.Domain}
+}
+
+// accountFields 把 tokenBundle 投影为 buildLoginOutput 的 account 参数。
+func (tb tokenBundle) accountFields() struct {
+	UID          string `json:"uid"`
+	EnterpriseID string `json:"enterpriseId"`
+	Nickname     string `json:"nickname"`
+} {
+	return struct {
+		UID          string `json:"uid"`
+		EnterpriseID string `json:"enterpriseId"`
+		Nickname     string `json:"nickname"`
+	}{tb.UID, tb.EnterpriseID, tb.Nickname}
+}
+
+// fetchAuthURL 向 base 的 state 端点 POST 取授权 URL 与 state（不落盘）。
+// runURL（两段式）与 runOnce（单命令）共用，避免端点组装重复。
+func fetchAuthURL(client *http.Client, base, origin string) (authURL, state string, err error) {
+	headers := commonHeaders(origin)
+	data, _, err := doJSON(client, http.MethodPost, base+"/v2/plugin/auth/state?platform=CLI", headers, bytes.NewReader([]byte("{}")))
 	if err != nil {
 		return "", "", fmt.Errorf("auth state failed: %w", err)
 	}
@@ -96,27 +146,18 @@ func startAuth(client *http.Client) (authURL, state string, err error) {
 	return st.AuthURL, st.State, nil
 }
 
-// tokenBundle poll 成功后拿到的凭证
-type tokenBundle struct {
-	AccessToken  string
-	RefreshToken string
-	ExpiresIn    int64
-	Domain       string
-	UID          string
-	EnterpriseID string
-	Nickname     string
-}
-
-// pollAuth 换取 token（handlePollLogin, oauth.go:108-162）。
+// fetchToken 用 state 换 token 与账号信息（不落盘），runPoll 与 runOnce 共用。
 // auth/token 是权威登录状态端点，pending 时业务 code 非 0（"login ing"）。
-func pollAuth(client *http.Client, state string) (tokenBundle, error) {
+// 判定分层：网络层/5xx → token endpoint error；其余业务失败 → 登录未完成。
+func fetchToken(client *http.Client, base, origin, state string) (tokenBundle, error) {
 	var out tokenBundle
-	tokRaw, status, errTok := doJSON(client, http.MethodGet, endpointAuthToken+state, nil, nil)
+	headers := commonHeaders(origin)
+	tokRaw, status, errTok := doJSON(client, http.MethodGet, base+"/v2/plugin/auth/token?state="+state, headers, nil)
 	if errTok != nil {
 		if status == 0 || status >= 500 {
 			return out, fmt.Errorf("token endpoint error: %w", errTok)
 		}
-		return out, fmt.Errorf("登录未完成（waiting for login）")
+		return out, fmt.Errorf("登录未完成（waiting for login）。请确认已在浏览器完成登录再按 y")
 	}
 	var tok struct {
 		AccessToken  string `json:"accessToken"`
@@ -125,7 +166,7 @@ func pollAuth(client *http.Client, state string) (tokenBundle, error) {
 		Domain       string `json:"domain"`
 	}
 	if err := json.Unmarshal(tokRaw, &tok); err != nil || tok.AccessToken == "" {
-		return out, fmt.Errorf("登录未完成（waiting for login）")
+		return out, fmt.Errorf("登录未完成（waiting for login）。请确认已在浏览器完成登录再按 y")
 	}
 	out.AccessToken = tok.AccessToken
 	out.RefreshToken = tok.RefreshToken
@@ -139,10 +180,10 @@ func pollAuth(client *http.Client, state string) (tokenBundle, error) {
 		Nickname     string `json:"nickname"`
 	}
 	acctHeaders := func(r *http.Request) {
-		commonHeaders(r)
+		headers(r)
 		r.Header.Set("Authorization", "Bearer "+tok.AccessToken)
 	}
-	if acctRaw, _, errAcct := doJSON(client, http.MethodGet, endpointLoginAcct+state, acctHeaders, nil); errAcct == nil {
+	if acctRaw, _, errAcct := doJSON(client, http.MethodGet, base+"/v2/plugin/login/account?state="+state, acctHeaders, nil); errAcct == nil {
 		_ = json.Unmarshal(acctRaw, &acct)
 	}
 	out.UID = acct.UID

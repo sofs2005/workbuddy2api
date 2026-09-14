@@ -26,9 +26,21 @@ func PrepareBodyOptWithEfforts(src []byte, sanitize bool, efforts map[string][]s
 		return src
 	}
 	obj["stream"] = true
+	// stream_options 仅当 body 未显式带时补 {include_usage: true}（D7）：
+	// 官方 CLI 流式必发该字段，上游据此在末帧返回 usage 用量；显式带则不覆盖。
+	if _, has := obj["stream_options"]; !has {
+		obj["stream_options"] = map[string]any{"include_usage": true}
+	}
 	normalizeToolChoice(obj)
 	normalizeRoles(obj)
+	// DeepSeek 思维链开关（见 thinking.go）：注入 thinking.type=enabled + 缺档补默认档。
+	// 先于 normalizeReasoningEffort 执行：补入的默认档也要走既有降级管线，
+	// 模型不支持默认档时自动落到 ≤ 默认档的最高支持档（不出站不合规档位）。
+	injectThinking(obj)
 	normalizeReasoningEffort(obj, efforts)
+	// DeepSeek 多轮一致性：assistant 消息带 reasoning 痕迹时回填 reasoning_content
+	// （requiresReasoningContentOnAssistantMessages，见 thinking.go）。
+	backfillReasoningContent(obj)
 	if sanitize {
 		if msgs, ok := obj["messages"].([]any); ok {
 			sanitizeMessages(msgs)
@@ -89,7 +101,7 @@ func normalizeReasoningEffort(obj map[string]any, efforts map[string][]string) {
 	if best != "" {
 		if !strings.EqualFold(best, reqStr) {
 			obj[key] = best
-			log.Printf("reasoning_effort downgraded model=%s %s -> %s", model, reqStr, best)
+			log.Printf("WARN: [upstream] reasoning_effort downgraded model=%s %s -> %s", model, reqStr, best)
 		}
 		return
 	}
@@ -103,7 +115,7 @@ func normalizeReasoningEffort(obj map[string]any, efforts map[string][]string) {
 	}
 	if lowest != "" {
 		obj[key] = lowest
-		log.Printf("reasoning_effort floored model=%s %s -> %s", model, reqStr, lowest)
+		log.Printf("WARN: [upstream] reasoning_effort floored model=%s %s -> %s", model, reqStr, lowest)
 	}
 }
 
@@ -134,9 +146,39 @@ func normalizeRoles(obj map[string]any) {
 		}
 		if strings.EqualFold(strings.TrimSpace(role), "developer") {
 			msg["role"] = "system"
-			log.Printf("role normalized developer->system idx=%d", i)
+			log.Printf("[upstream] role normalized developer->system idx=%d", i)
 		}
 	}
+}
+
+// ensureConsoleSystem global realm 兜底 system 注入（吸收 PR #45，防 console 域上游 code 11-128）：
+// 首条消息非 system 时在 messages 最前补一条 fallback system（"You are a helpful assistant."）。
+// 仅对 global 请求调用（CN 现状不动；即使首条就是 system 也不重复注入）。
+// body 不可解析时原样返回（与 prepareBody 语义一致：坏 body 不在这里二次错误化）。
+func ensureConsoleSystem(body []byte) []byte {
+	if len(body) == 0 {
+		return body
+	}
+	var obj map[string]any
+	if err := json.Unmarshal(body, &obj); err != nil {
+		return body
+	}
+	msgs, ok := obj["messages"].([]any)
+	if !ok || len(msgs) == 0 {
+		return body
+	}
+	first, ok := msgs[0].(map[string]any)
+	if ok {
+		if role, _ := first["role"].(string); strings.EqualFold(strings.TrimSpace(role), "system") {
+			return body // 首条已是 system：不注入
+		}
+	}
+	obj["messages"] = append([]any{map[string]any{"role": "system", "content": "You are a helpful assistant."}}, msgs...)
+	out, err := json.Marshal(obj)
+	if err != nil {
+		return body
+	}
+	return out
 }
 
 // normalizeToolChoice 按上游 Go struct（string 类型）改写 OpenAI tool_choice。

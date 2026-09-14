@@ -198,6 +198,56 @@ func sortInts(a []int) {
 	}
 }
 
+// backfillToolCallNames 维护跨帧的 tool_calls name 缓存并回填：
+// 上游流式分片中，首 chunk 带 function.name，后续 chunk 常缺省或置空 ""，
+// 逐 chunk 消费的客户端会把工具名清空导致 tool call 卡死（hawklithm/workbuddy2api issue#2）。
+// 按 delta.tool_calls 的 index 缓存首现的非空 name，后续分片缺 name 时回填；
+// 只动 tool_calls 的 function.name 字段，其余透传不变。
+func backfillToolCallNames(obj map[string]any, names map[int]string) {
+	choices, _ := obj["choices"].([]any)
+	for _, ci := range choices {
+		c, _ := ci.(map[string]any)
+		if c == nil {
+			continue
+		}
+		delta, _ := c["delta"].(map[string]any)
+		if delta == nil {
+			continue
+		}
+		tcs, _ := delta["tool_calls"].([]any)
+		for _, tci := range tcs {
+			tc, _ := tci.(map[string]any)
+			if tc == nil {
+				continue
+			}
+			idx := 0
+			if v, ok := tc["index"].(float64); ok {
+				idx = int(v)
+			}
+			fn, _ := tc["function"].(map[string]any)
+			name := ""
+			if fn != nil {
+				if v, ok := fn["name"].(string); ok {
+					name = v
+				}
+			}
+			if name != "" {
+				// 缓存：后续分片以本次为准（覆盖旧值，允许上游中途改名）。
+				names[idx] = name
+				continue
+			}
+			// 缺/空 name：从缓存回填（首现分片已缓存，这里命中同 index 的后续分片）。
+			if cached, ok := names[idx]; ok {
+				if fn == nil {
+					fn = map[string]any{}
+					tc["function"] = fn
+				}
+				fn["name"] = cached
+			}
+		}
+	}
+}
+
 // normalizeFrame 以 OpenAI 流式规范白名单重建帧：仅保留标准字段，
 // 剔除上游噪声（finish_reason:"" → null、空 content/refusal、空 tool_calls 列表、
 // 空占位 function_call、顶层未知字段），空 delta 键一律省略，
@@ -287,12 +337,34 @@ func Stream(w http.ResponseWriter, r io.Reader) error {
 	h.Set("X-Accel-Buffering", "no")
 	fl, _ := w.(http.Flusher)
 
+	// toolCallNames 跨帧维护 delta.tool_calls[index] → function.name，
+	// 供逐 chunk 透传时回填被上游清空的 name（hawklithm/workbuddy2api issue#2）。
+	toolCallNames := map[int]string{}
+
+	// firstID 透传流的消息级 id 基准：缓存首个非空上游 id，后续帧缺失/空串时复用
+	// （issue #35：同一条 SSE 消息所有帧共用一个真实 id，后台按 id 归并；此前中间帧
+	// 一律补 chatcmpl-wb2api 哨兵，造成同流 id 分裂）。全流无真实 id → 才出现哨兵。
+	firstID := ""
+
 	// writeFrame 把 payload 按规范白名单重建后以 data: 帧写出并 flush。
 	// 仅 JSON 解析成功时计数记为一次有效转发（JSON 解析失败照常降级原样写出，但不计数）。
 	writeFrame := func(payload string) (int, error) {
 		var obj map[string]any
 		valid := 0
 		if json.Unmarshal([]byte(payload), &obj) == nil {
+			// 先按 index 回填 tool_calls name（上游后续 chunk 常缺省/置空），再规范化透传。
+			backfillToolCallNames(obj, toolCallNames)
+			// id 续传：首帧非空真实 id 缓存；后续帧缺 id / 空 id 一律用缓存值，
+			// 有自己 id 的帧保持原样（不同流分裂的帧允许各自 id）。
+			if firstID == "" {
+				if v, ok := obj["id"].(string); ok && v != "" {
+					firstID = v
+				}
+			} else {
+				if v, ok := obj["id"].(string); !ok || v == "" {
+					obj["id"] = firstID
+				}
+			}
 			if raw, err := json.Marshal(normalizeFrame(obj)); err == nil {
 				payload = string(raw)
 			}

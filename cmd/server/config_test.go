@@ -289,6 +289,16 @@ func TestScheduleEnabledByDefault(t *testing.T) {
 	if len(c.Schedule.ActivityHours) != 1 || c.Schedule.ActivityHours[0] != 10 {
 		t.Errorf("activity_hours=%v want [10]", c.Schedule.ActivityHours)
 	}
+	if len(c.Schedule.SchoolHours) != 1 || c.Schedule.SchoolHours[0] != 12 {
+		t.Errorf("school_hours=%v want [12]", c.Schedule.SchoolHours)
+	}
+	if len(c.Schedule.CatHours) != 1 || c.Schedule.CatHours[0] != 1 {
+		t.Errorf("cat_hours=%v want [1]", c.Schedule.CatHours)
+	}
+	if !c.Schedule.SchoolEnabled || !c.Schedule.CatEnabled {
+		t.Errorf("school/cat enabled defaults want true/true, got %v/%v",
+			c.Schedule.SchoolEnabled, c.Schedule.CatEnabled)
+	}
 }
 
 // TestScheduleLegacyConfigKeepsRunning 老 config（只写签到/保活小时数组，无新键）加载后仍是启用态，
@@ -316,6 +326,15 @@ func TestScheduleLegacyConfigKeepsRunning(t *testing.T) {
 	}
 	if len(c.Schedule.ActivityHours) != 1 || c.Schedule.ActivityHours[0] != 10 {
 		t.Errorf("activity_hours=%v want default [10]", c.Schedule.ActivityHours)
+	}
+	if len(c.Schedule.SchoolHours) != 1 || c.Schedule.SchoolHours[0] != 12 {
+		t.Errorf("school_hours=%v want default [12]", c.Schedule.SchoolHours)
+	}
+	if len(c.Schedule.CatHours) != 1 || c.Schedule.CatHours[0] != 1 {
+		t.Errorf("cat_hours=%v want default [1]", c.Schedule.CatHours)
+	}
+	if !c.Schedule.SchoolEnabled || !c.Schedule.CatEnabled {
+		t.Errorf("school/cat switches must default true on legacy config: %+v", c.Schedule)
 	}
 }
 
@@ -489,5 +508,217 @@ func TestBadSessionTTL(t *testing.T) {
 	os.WriteFile(fp, []byte(`{"session_sticky":{"ttl":"oops"}}`), 0o600)
 	if _, err := Load(fp); err == nil {
 		t.Fatal("want error for bad session_sticky.ttl")
+	}
+}
+
+// TestMaxBodyDefault 默认 max_body_mb=8。
+func TestMaxBodyDefault(t *testing.T) {
+	c := Default()
+	if err := c.normalize(); err != nil {
+		t.Fatalf("normalize: %v", err)
+	}
+	if c.Server.MaxBodyMB != 8 {
+		t.Errorf("max_body_mb=%d want 8", c.Server.MaxBodyMB)
+	}
+}
+
+// TestMaxBodyExplicit 显式设置 max_body_mb。
+func TestMaxBodyExplicit(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "c.json")
+	os.WriteFile(fp, []byte(`{"server":{"max_body_mb":16}}`), 0o600)
+	c, err := Load(fp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Server.MaxBodyMB != 16 {
+		t.Errorf("max_body_mb=%d want 16", c.Server.MaxBodyMB)
+	}
+}
+
+// TestMaxBodyInvalid 非法值（0/负数）normalize 报错：0 想表达"不限"会被静默当成 8MB，
+// 与其误导不如 fail fast 提示显式配大上限。
+func TestMaxBodyInvalid(t *testing.T) {
+	for _, v := range []string{"0", "-1"} {
+		dir := t.TempDir()
+		fp := filepath.Join(dir, "c.json")
+		os.WriteFile(fp, []byte(`{"server":{"max_body_mb":`+v+`}}`), 0o600)
+		_, err := Load(fp)
+		if err == nil {
+			t.Fatalf("want error for max_body_mb=%s", v)
+		}
+		if !strings.Contains(err.Error(), "server.max_body_mb") {
+			t.Errorf("error should name config key server.max_body_mb: %v", err)
+		}
+	}
+}
+
+// TestMaxBodyEnvOverride env WB2A_MAX_BODY_MB 非空覆盖 JSON 值。
+func TestMaxBodyEnvOverride(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "c.json")
+	os.WriteFile(fp, []byte(`{"server":{"max_body_mb":4}}`), 0o600)
+	t.Setenv("WB2A_MAX_BODY_MB", "12")
+	c, err := Load(fp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Server.MaxBodyMB != 12 {
+		t.Errorf("max_body_mb=%d want env 12", c.Server.MaxBodyMB)
+	}
+}
+
+// TestPromptDefaultCustom 默认 prompt.mode=custom 且 PromptText 为内置默认（非空）。
+func TestPromptDefaultCustom(t *testing.T) {
+	c, err := Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Prompt.Mode != "custom" {
+		t.Errorf("prompt.mode=%q want custom", c.Prompt.Mode)
+	}
+	if c.PromptText == "" {
+		t.Error("PromptText should be non-empty (built-in default)")
+	}
+}
+
+// TestPromptExplicitPassthrough passthrough 模式不加载文本（透传客户端原始 system）。
+func TestPromptExplicitPassthrough(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "c.json")
+	os.WriteFile(fp, []byte(`{"prompt":{"mode":"passthrough"}}`), 0o600)
+	c, err := Load(fp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Prompt.Mode != "passthrough" {
+		t.Errorf("mode=%q want passthrough", c.Prompt.Mode)
+	}
+	if c.PromptText != "" {
+		t.Errorf("passthrough should not load PromptText, got len=%d", len(c.PromptText))
+	}
+}
+
+// TestPromptInvalidMode 非法 mode 启动报错。
+func TestPromptInvalidMode(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "c.json")
+	os.WriteFile(fp, []byte(`{"prompt":{"mode":"bogus"}}`), 0o600)
+	if _, err := Load(fp); err == nil {
+		t.Fatal("want error for invalid prompt.mode")
+	}
+}
+
+// TestPromptFileMissing 文件路径非空但不存在 → 启动报错（fail fast）。
+func TestPromptFileMissing(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "c.json")
+	os.WriteFile(fp, []byte(`{"prompt":{"mode":"custom","file":"/nonexistent/p.md"}}`), 0o600)
+	if _, err := Load(fp); err == nil {
+		t.Fatal("want error for missing prompt file")
+	}
+}
+
+// TestPromptFileOverride 自定义 file 覆盖内置默认。
+func TestPromptFileOverride(t *testing.T) {
+	dir := t.TempDir()
+	pf := filepath.Join(dir, "my.md")
+	want := "我的自定义人格入口"
+	os.WriteFile(pf, []byte(want), 0o600)
+	cf := filepath.Join(dir, "c.json")
+	os.WriteFile(cf, []byte(`{"prompt":{"mode":"custom","file":"`+pf+`"}}`), 0o600)
+	c, err := Load(cf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.PromptText != want {
+		t.Errorf("PromptText=%q want %q", c.PromptText, want)
+	}
+}
+
+// TestPromptEnvOverride env 覆盖 prompt.mode 与 prompt.file。
+func TestPromptEnvOverride(t *testing.T) {
+	t.Setenv("WB2A_PROMPT_MODE", "passthrough")
+	c, err := Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Prompt.Mode != "passthrough" {
+		t.Errorf("mode=%q want passthrough", c.Prompt.Mode)
+	}
+}
+
+// TestPromptLegacyConfigNoImpact 旧 config（无 prompt 段）零影响：mode 仍 custom。
+func TestPromptLegacyConfigNoImpact(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "c.json")
+	os.WriteFile(fp, []byte(`{"listen":":9999","api_key":"k"}`), 0o600)
+	c, err := Load(fp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Prompt.Mode != "custom" {
+		t.Errorf("legacy config should default to custom, got %q", c.Prompt.Mode)
+	}
+	if c.Listen != ":9999" {
+		t.Errorf("listen=%q", c.Listen)
+	}
+}
+
+// TestUpstreamVersionConfig 配置 upstream.client_version / cli_version 与 env
+// WB2A_CLIENT_VERSION / WB2A_CLI_VERSION 均生效；缺省空串 = headers 层回落内置默认。
+func TestUpstreamVersionConfig(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "c.json")
+	os.WriteFile(fp, []byte(`{"upstream":{"client_version":"6.0.0","cli_version":"3.0.0"}}`), 0o600)
+	c, err := Load(fp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Upstream.ClientVersion != "6.0.0" || c.Upstream.CliVersion != "3.0.0" {
+		t.Errorf("client_version=%q cli_version=%q want 6.0.0/3.0.0", c.Upstream.ClientVersion, c.Upstream.CliVersion)
+	}
+	// 缺省为空（headers 层回落内置默认）。
+	if c2, err := Load(""); err != nil || c2.Upstream.ClientVersion != "" || c2.Upstream.CliVersion != "" {
+		t.Errorf("default versions=%q/%q want empty (err=%v)", c2.Upstream.ClientVersion, c2.Upstream.CliVersion, err)
+	}
+	// env 覆盖。
+	t.Setenv("WB2A_CLIENT_VERSION", "7.0.0")
+	t.Setenv("WB2A_CLI_VERSION", "4.0.0")
+	c3, err := Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c3.Upstream.ClientVersion != "7.0.0" || c3.Upstream.CliVersion != "4.0.0" {
+		t.Errorf("env versions=%q/%q want 7.0.0/4.0.0", c3.Upstream.ClientVersion, c3.Upstream.CliVersion)
+	}
+}
+
+// TestUpstreamUserAgentConfig 配置 upstream.user_agent 与 env WB2A_USER_AGENT 均生效，
+// 缺省空串保持现状（headers 层回落到 clientUA）。
+func TestUpstreamUserAgentConfig(t *testing.T) {
+	// JSON 配置
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "c.json")
+	os.WriteFile(fp, []byte(`{"upstream":{"user_agent":"WorkBuddy/1.2.3"}}`), 0o600)
+	c, err := Load(fp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Upstream.UserAgent != "WorkBuddy/1.2.3" {
+		t.Errorf("user_agent=%q want WorkBuddy/1.2.3", c.Upstream.UserAgent)
+	}
+	// 缺省为空
+	if c2, err := Load(""); err != nil || c2.Upstream.UserAgent != "" {
+		t.Errorf("default user_agent=%q want empty (err=%v)", c2.Upstream.UserAgent, err)
+	}
+	// env 覆盖
+	t.Setenv("WB2A_USER_AGENT", "EnvAgent/9")
+	c3, err := Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c3.Upstream.UserAgent != "EnvAgent/9" {
+		t.Errorf("env user_agent=%q want EnvAgent/9", c3.Upstream.UserAgent)
 	}
 }
