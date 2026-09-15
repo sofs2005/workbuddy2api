@@ -21,11 +21,25 @@
 
 ## 项目简介
 
-WorkBuddy2API 是一个自托管的 **OpenAI 兼容反向代理网关**，将 ```CodeBuddy``` 账号包装为统一的 `/v1/chat/completions` 服务。
+WorkBuddy2API 是一个自托管的 **OpenAI 兼容上游网关**，将 ```CodeBuddy``` 账号包装为统一的 `/v1/chat/completions` 服务。
 
-- 官方不提供 OpenAI 形态的开放 API，本项目通过 **OAuth 设备授权**（`login.sh`）获取账号凭证，在网关侧做 token 自动刷新、账号池调度与流量治理；
+### 本项目做什么
+
+- 通过 **OAuth 设备授权**（`login.sh`）获取账号凭证，在网关侧做 token 自动刷新、账号池调度与流量治理；
 - 面向 **个人多账号** 场景：多账号共享、单号故障自动换号、冷却 / 熔断防止雪崩、会话粘性保证多轮上下文不跳号；
 - 对客户端只暴露 OpenAI 兼容接口，现有 SDK / 前端 / 工具 **零改造接入**。
+
+### 本项目不做什么
+
+- **只做上游网关，不做下游协议转换** — 本项目仅负责对接上游 ```CodeBuddy``` 并暴露 OpenAI Chat 协议；Anthropic Messages、Gemini 等其他协议的适配应由下游网关负责；
+- **不内嵌 Web 管理面板** — 网关核心保持精简，可视化面板作为独立项目维护，数据直取上游接口，不增加网关适配负担。
+
+### 社区前端面板
+
+需要 Web 管理面板的用户，可部署以下符合本理念的社区项目（独立维护，与网关解耦）：
+
+- [workbuddy2api-gui](https://github.com/287775856/workbuddy2api-gui) — 账号池状态可视化面板
+- [workbuddy-manager](https://github.com/ithtelab/workbuddy-manager) — 账号管理工具
 
 > ⚠️ 合规须知：本项目是**非官方**网关，使用 ```CodeBuddy``` 账号作为上游，**仅限本人授权账号、本机 / 私有环境测试**。详细边界见[安全与合规](#安全与合规)。
 
@@ -90,9 +104,9 @@ flowchart LR
     subgraph GWI["WorkBuddy2API 网关 :7863"]
         H["HTTP Handler\n鉴权 · 请求体上限 · 提示词改写 · 轮转"] --> P
         H --> S
-        P["账号池\n三因子加权 · 熔断 · 冷却 · 租约"] --> U
+        P["账号池\n四因子加权 · 熔断 · 冷却 · 租约"] --> U
         S["会话粘性路由"] -.绑定镜像.-> REDIS
-        T["定时调度\n签到 09/21 · 旅行 09/21 · 活跃 10 · 保活 22"] --> P
+        T["定时调度\n签到 09/21 · 旅行 09/21 · 活跃 10 · 保活 22\n开学季 12 · 夜猫子 01"] --> P
         U["上游 Client\nChatHTTP 流式 · 短 RPC"]
     end
 
@@ -196,6 +210,18 @@ docker compose pull && docker compose up -d
 
 镜像由 GitHub Actions 在 `master` 推送时自动构建发布到 GHCR；也可 `docker compose up -d --build` 从源码本地构建。
 
+> **非 root 宿主用户注意**：`./login.sh` 以**当前宿主用户**落盘凭证（权限 0600），而容器内网关以 `app(uid 10001)` 读 + 回写（refresh / realm 补标识走 tmp+rename，需要目录写权限）。二者 uid 不同（例如 Linux 非 root 账号通常是 uid 1000）时容器读不到凭证文件，`/status` 账号数为 0——与 `./data` 卷的属主问题同源。登录后、启动前把目录属主交给 10001（root 或部署用户执行）：
+>
+> ```bash
+> chown -R 10001:10001 ./auths
+> ```
+>
+> 之后新增账号建议进**容器内**登录（`app` 自身落盘，属主即 10001，无需反复 chown；容器内无 docker CLI，完成后回宿主机重启）：
+>
+> ```bash
+> docker compose exec -it wb2api bash -c './login.sh' && docker compose restart wb2api
+> ```
+
 ### 源码构建
 
 ```bash
@@ -240,7 +266,7 @@ curl -s http://localhost:7863/v1/chat/completions \
 
 ### 发布来源与合规边界
 
-- **无预编译 release**：仓库无 Release / tag，产物 = 源码自构建（Dockerfile 多阶段在本地构建时完成）
+- **CI 自动打包**：GitHub Actions（`.github/workflows/build.yml`）每日定时 + push tag 触发多架构（amd64/arm64）构建，发布至 `ghcr.io`，同时输出 amd64 离线 `tar.gz` artifact 供 NAS / 离线环境使用；也可本地 `docker compose build` 自构建
 - 登录 / 签到 / 积分工具：`./login.sh` / `./signin.sh` / `./credit.sh`
 - **无产物校验和**：`go.sum` 仅约束 Go 模块依赖；Docker 镜像由本地 `docker compose build` 生成，未引用第三方镜像
 - 上游 CodeBuddy 属第三方商业产品，本项目是其**非官方 OpenAI 兼容网关**；使用其账号做 API 网关涉及目标平台服务条款与账号风险，作者不对账号封禁、条款违约或使用结果负责

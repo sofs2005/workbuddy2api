@@ -96,24 +96,36 @@ fi
 
 EXPIRES_AT=$(( $(date +%s) + EXPIRES_IN ))
 
+# OAuth 返回字段一律通过环境变量传入 Python，并使用带引号 heredoc：
+# 昵称/domain/token 等值可含引号或换行，不得拼进 Python 源码。
+
 # ─── 签到（仅 CN：POST codebuddy.cn/v2/billing/meter/daily-checkin，幂等不阻塞。
 #      global realm 跳过——国际版计费端点与签到端点未实测，避免误打 CN 端点）───
 if [[ "$REALM" == "global" ]]; then
     echo "签到: global realm 跳过（国际版签到端点未实测）"
 else
-python3 - <<PYEOF
-import json, urllib.request, urllib.error
+WB2A_LOGIN_TOKEN="$TOKEN" \
+WB2A_LOGIN_USER_ID="$USER_ID" \
+WB2A_LOGIN_ENT_ID="$ENT_ID" \
+WB2A_LOGIN_DOMAIN="$DOMAIN" \
+python3 - <<'PYEOF'
+import json, os, urllib.request, urllib.error
+
+token = os.environ["WB2A_LOGIN_TOKEN"]
+user_id = os.environ["WB2A_LOGIN_USER_ID"]
+enterprise_id = os.environ["WB2A_LOGIN_ENT_ID"]
+domain = os.environ["WB2A_LOGIN_DOMAIN"]
 
 req = urllib.request.Request(
     "https://www.codebuddy.cn/v2/billing/meter/daily-checkin",
     method="POST", data=b"{}",
     headers={
-        "Authorization": "Bearer $TOKEN",
+        "Authorization": "Bearer " + token,
         "Accept": "application/json",
         "Content-Type": "application/json",
-        "X-User-Id": "$USER_ID",
-        **({"X-Enterprise-Id": "$ENT_ID", "X-Tenant-Id": "$ENT_ID"} if "$ENT_ID" else {}),
-        **({"X-Domain": "$DOMAIN"} if "$DOMAIN" else {}),
+        "X-User-Id": user_id,
+        **({"X-Enterprise-Id": enterprise_id, "X-Tenant-Id": enterprise_id} if enterprise_id else {}),
+        **({"X-Domain": domain} if domain else {}),
     })
 try:
     with urllib.request.urlopen(req, timeout=15) as r:
@@ -144,26 +156,60 @@ else
     echo "新账号（uid=${USER_ID}），新增 auth 文件"
     ACTION="新增"
 fi
-python3 - <<PYEOF
-import json
+WB2A_LOGIN_TOKEN="$TOKEN" \
+WB2A_LOGIN_REFRESH="$REFRESH" \
+WB2A_LOGIN_EXPIRES_AT="$EXPIRES_AT" \
+WB2A_LOGIN_DOMAIN="$DOMAIN" \
+WB2A_LOGIN_USER_ID="$USER_ID" \
+WB2A_LOGIN_ENT_ID="$ENT_ID" \
+WB2A_LOGIN_NICKNAME="$NICKNAME" \
+WB2A_LOGIN_REALM="$REALM" \
+WB2A_LOGIN_AUTH_FILE="$AUTH_FILE" \
+WB2A_LOGIN_ACTION="$ACTION" \
+python3 - <<'PYEOF'
+import json, os, sys, tempfile
 
 auth = {
     "account": {
-        "uid": "$USER_ID",
-        "enterpriseId": "$ENT_ID",
-        "nickname": "$NICKNAME"
+        "uid": os.environ["WB2A_LOGIN_USER_ID"],
+        "enterpriseId": os.environ["WB2A_LOGIN_ENT_ID"],
+        "nickname": os.environ["WB2A_LOGIN_NICKNAME"]
     },
     "auth": {
-        "accessToken": "$TOKEN",
-        "refreshToken": "$REFRESH",
-        "expiresAt": $EXPIRES_AT,
-        "domain": "$DOMAIN",
-        "realm": "$REALM"
+        "accessToken": os.environ["WB2A_LOGIN_TOKEN"],
+        "refreshToken": os.environ["WB2A_LOGIN_REFRESH"],
+        "expiresAt": int(os.environ["WB2A_LOGIN_EXPIRES_AT"]),
+        "domain": os.environ["WB2A_LOGIN_DOMAIN"],
+        "realm": os.environ["WB2A_LOGIN_REALM"]
     }
 }
-with open("$AUTH_FILE", "w") as f:
-    json.dump(auth, f, indent=1)
-print(f"已保存（${ACTION}）: $AUTH_FILE")
+auth_file = os.environ["WB2A_LOGIN_AUTH_FILE"]
+# 容器内 app 运行 uid（Dockerfile USER 10001）：属主不匹配会导致账号数为 0（issue #108）
+CONTAINER_UID = 10001
+fd, tmp_file = tempfile.mkstemp(prefix=".workbuddy-auth-", dir=os.path.dirname(auth_file) or ".")
+try:
+    with os.fdopen(fd, "w") as f:
+        json.dump(auth, f, indent=1)
+    os.replace(tmp_file, auth_file)
+    # 权限检测：容器内 app(uid 10001) 需要读此文件
+    st = os.stat(auth_file)
+    if st.st_uid != CONTAINER_UID:
+        print(f"\n⚠️  权限警告：{auth_file} 属主 uid={st.st_uid}，容器内 app(uid={CONTAINER_UID}) 可能读不到")
+        print(f"    请执行：chown -R {CONTAINER_UID}:{CONTAINER_UID} ./auths")
+        print(f"    或在容器内登录（属主自动正确）：docker compose exec -it wb2api bash -c './login.sh'\n")
+except Exception:
+    try:
+        os.unlink(tmp_file)
+    except FileNotFoundError:
+        pass
+    # 写入失败诊断：目录不可写时给出具体指引
+    auth_dir = os.path.dirname(auth_file) or "."
+    if not os.access(auth_dir, os.W_OK):
+        print(f"\n❌ 写入失败：目录 {auth_dir} 不可写（权限不足）", file=sys.stderr)
+        print(f"    请执行：chown -R {CONTAINER_UID}:{CONTAINER_UID} ./auths", file=sys.stderr)
+        print(f"    或在容器内登录：docker compose exec -it wb2api bash -c './login.sh'\n", file=sys.stderr)
+    raise
+print(f"已保存（{os.environ['WB2A_LOGIN_ACTION']}）: {auth_file}")
 PYEOF
 
 # ─── 国际版注册激活 + trial 领取（仅 global；token 已落盘，失败只提示不阻断）──────
@@ -174,7 +220,9 @@ PYEOF
 # scripts/global_region.py 逆向后端自动完善：拉地区列表 → 终端选项单 → 提交地区
 # → 重新 register 验证。任何失败不回退登录结果（auth 文件已写好）。
 if [[ "$REALM" == "global" ]]; then
-python3 - <<PYEOF
+WB2A_LOGIN_TOKEN="$TOKEN" \
+WB2A_LOGIN_USER_ID="$USER_ID" \
+python3 - <<'PYEOF'
 import json, os, sys, urllib.request, urllib.error
 
 # scripts/global_region.py 定位：仓库根 scripts/（host；login.sh 已 cd 到仓库根）或
@@ -188,8 +236,8 @@ except ImportError as e:
     print(f"注册地区: 未加载 global_region.py（{e}），跳过完善+trial 步骤")
 
 GLOBAL_BASE = "https://www.workbuddy.ai"
-ACCOUNT_UID = "$USER_ID"
-TOKEN = "$TOKEN"
+ACCOUNT_UID = os.environ["WB2A_LOGIN_USER_ID"]
+TOKEN = os.environ["WB2A_LOGIN_TOKEN"]
 
 
 def _register_inline():

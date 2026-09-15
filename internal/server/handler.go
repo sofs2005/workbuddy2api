@@ -2,6 +2,7 @@
 package server
 
 import (
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -102,7 +103,11 @@ func (h *Handler) withAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if h.cfg.APIKey != "" {
 			authz := r.Header.Get("Authorization")
-			if !strings.HasPrefix(authz, "Bearer ") || strings.TrimPrefix(authz, "Bearer ") != h.cfg.APIKey {
+			// 常量时间比较（发现 7）：!= 短路时序随前缀长度变化，公网暴露下
+			// 理论上可逐字节探测 key 前缀；ConstantTimeCompare 消除该信号。
+			provided := strings.TrimPrefix(authz, "Bearer ")
+			if !strings.HasPrefix(authz, "Bearer ") ||
+				subtle.ConstantTimeCompare([]byte(provided), []byte(h.cfg.APIKey)) != 1 {
 				writeOpenAIError(w, http.StatusUnauthorized, "invalid_api_key", "missing or invalid API key")
 				return
 			}
@@ -218,6 +223,75 @@ func (h *Handler) models(w http.ResponseWriter, r *http.Request) {
 // 保留本别名引用，避免 handler 侧魔法数字与 upstream overlay 重复维护。
 var globalModels = upstream.GlobalModelNames
 
+// fmtCreditsPrefix 从上游 credits 原文提取倍率并格式化为 "[x0.05 credit]"。
+// 上游格式不统一："x0.05 credits" / "x0.29" / "x0.00 credits" 等，
+// 统一提取 x数字 部分，去 "credits" 后缀。
+func fmtCreditsPrefix(raw string) string {
+	s := strings.TrimSpace(raw)
+	// 去掉 "credits" 后缀
+	s = strings.TrimSuffix(s, "credits")
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return ""
+	}
+	return "[" + s + " credit]"
+}
+
+// applyModelInfoFields 把上游模型对象全字段（ModelInfo）按「空值省略」写出规则
+// 合入 /v1/models 条目：name/description/credits/tags/vendor/能力旗标/
+// max_allowed_size/reasoning_effort/reasoning_summary。CN 动态分支与 global
+// 探测命中分支共用（两域模型对象同构），保证输出字段集一致。
+// 不覆盖 id/object/created/owned_by 及调用方先前写好的基础字段；上游未下发的
+// 字段（零值）整体省略——不编造。
+func applyModelInfoFields(entry map[string]any, mi upstream.ModelInfo) map[string]any {
+	if mi.Name != "" {
+		entry["name"] = mi.Name
+	}
+	if mi.Description != "" {
+		// 积分倍率前缀：从 "x0.05 credits" / "x0.29" 等格式提取纯数字，
+		// 统一为 "[x0.05 credit]" 前缀拼入 description，方便下游面板直接展示。
+		if mi.Credits != "" {
+			entry["description"] = fmtCreditsPrefix(mi.Credits) + " " + mi.Description
+		} else {
+			entry["description"] = mi.Description // descriptionZh 中文描述
+		}
+	}
+	if mi.Credits != "" {
+		entry["credits"] = mi.Credits // 积分倍率原文（如 "x0.05"），仅展示
+	}
+	if len(mi.Tags) > 0 {
+		entry["tags"] = mi.Tags
+	}
+	if mi.Vendor != "" {
+		entry["vendor"] = mi.Vendor
+	}
+	if mi.IsDefault {
+		entry["is_default"] = true
+	}
+	if mi.SupportsImages {
+		entry["supports_images"] = true // 多模态能力透出
+	}
+	if mi.SupportsReasoning {
+		entry["supports_reasoning"] = true
+	}
+	if mi.SupportsToolCall {
+		entry["supports_tool_call"] = true
+	}
+	if mi.OnlyReasoning {
+		entry["only_reasoning"] = true
+	}
+	if mi.MaxAllowedSize > 0 {
+		entry["max_allowed_size"] = mi.MaxAllowedSize
+	}
+	if mi.ReasoningEffort != "" {
+		entry["reasoning_effort"] = mi.ReasoningEffort
+	}
+	if mi.ReasoningSummary != "" {
+		entry["reasoning_summary"] = mi.ReasoningSummary
+	}
+	return entry
+}
+
 // modelList 动态获取模型列表并包装成 OpenAI 格式（含 context_length）。
 // CN 模型输出统一加 "cn:" 前缀（gateway 路由协议，与 resolveModel 对称）。
 // 动态失败回退静态表；global.enabled=false（显式逃生门）时只列 CN（global 名单不出现）。
@@ -236,8 +310,15 @@ func (h *Handler) modelList() []map[string]any {
 			if mi.ContextWindow == 0 {
 				entry["context_length"] = 131072 // 兜底
 			}
-			if mi.SupportsImages {
-				entry["supports_images"] = true // P1：多模态能力透出
+			// 上游模型对象全字段透出（name/描述/标签/倍率/能力旗标等，空值省略）。
+			entry = applyModelInfoFields(entry, mi)
+			// P0：effort 能力透出——远端 supportedEfforts 权威，缺失落到 CN 静态兜底表
+			// （issue #84 客户端可发现档位，不再盲传）。无档位→省略字段（非空数组）。
+			if efforts, def := upstream.EffortListing("cn", mi.ID, mi.Efforts, mi.DefaultEffort); efforts != nil {
+				entry["reasoning_supported_efforts"] = efforts
+				if def != "" {
+					entry["reasoning_default_effort"] = def
+				}
 			}
 			out = append(out, entry)
 		}
@@ -249,6 +330,13 @@ func (h *Handler) modelList() []map[string]any {
 			}
 			if id, ok := m["id"].(string); ok {
 				e["id"] = "cn:" + id
+				// P0：静态兜底分支同样按 CN 静态档位表透出 effort 能力（远端不可用时的可发现性）。
+				if efforts, def := upstream.EffortListing("cn", id, nil, ""); efforts != nil {
+					e["reasoning_supported_efforts"] = efforts
+					if def != "" {
+						e["reasoning_default_effort"] = def
+					}
+				}
 			}
 			out = append(out, e)
 		}
@@ -257,32 +345,63 @@ func (h *Handler) modelList() []map[string]any {
 	// 名单 = 探测结果 ∪ §7.2 静态（fetchGlobalModels 内合并去重）；无 global 账号时
 	// 直接静态名单且零上游调用。
 	if h.cfg.GlobalEnabled {
-		for _, id := range h.fetchGlobalModels() {
-			out = append(out, map[string]any{
+		// global 域 effort 能力三级查找：探测下发桶（权威）→ 静态兜底表 → 省略。
+		// 先 fetchGlobalModels（内部探测并落 effort 桶），再按 id 取快照。
+		globalIDs, globalAccount := h.fetchGlobalModels()
+		// 探测对象形态的全字段条目（与 fetchGlobalModels 共享同一次探测缓存）：
+		// 命中 id 才透出富字段；窄表/失败 → nil，按裸 ID 条目输出（不编造字段）。
+		// globalAccount 为 nil（无 global 号）时返回 nil，跳过富字段映射。
+		globalInfos := map[string]upstream.ModelInfo{}
+		for _, mi := range h.cfg.Upstream.FetchGlobalModelInfos(globalAccount) {
+			globalInfos[mi.ID] = mi
+		}
+		globalEfforts, globalDefaults := h.cfg.Upstream.GlobalEffortSnapshot()
+		for _, id := range globalIDs {
+			entry := map[string]any{
 				"id":             "global:" + id,
 				"object":         "model",
 				"created":        1753600000,
 				"owned_by":       "workbuddy",
 				"context_length": 131072,
-			})
+			}
+			if mi, ok := globalInfos[id]; ok {
+				entry = applyModelInfoFields(entry, mi)
+				// 富条目命中：context_length/max_output_tokens 用探测真实值替换
+				// 131072 兜底（与 CN 动态分支同口径；上游零值保留兜底）。
+				if mi.ContextWindow > 0 {
+					entry["context_length"] = mi.ContextWindow
+				}
+				if mi.MaxTokens > 0 {
+					entry["max_output_tokens"] = mi.MaxTokens
+				}
+			}
+			if efforts, def := upstream.EffortListing("global", id, globalEfforts[id], globalDefaults[id]); efforts != nil {
+				entry["reasoning_supported_efforts"] = efforts
+				if def != "" {
+					entry["reasoning_default_effort"] = def
+				}
+			}
+			out = append(out, entry)
 		}
 	}
 	return out
 }
 
-// fetchGlobalModels 返回 global 模型名单（探测 ∪ 静态 overlay，去重）。
+// fetchGlobalModels 返回 global 模型名单（探测 ∪ 静态 overlay，去重）及被探测账号。
 // 与 fetchDynamicModels（CN 侧）同语义不同归位：缓存/失败回落封在 upstream.FetchGlobalModels
 // （内部 1h + 5min 负缓存）。本方法只负责"何时探测"：
-//   - 池中无 global 账号 → 直接静态名单（不发起上游调用）；
+//   - 池中无 global 账号 → 直接静态名单 + nil 账号（不发起上游调用）；
 //   - 有 global 账号 → 单账号 Pick（global 域谓词），交 upstream 探测并合并。
 //
+// 返回的 acct 供调用方在同一账号上取富 ModelInfo（FetchGlobalModelInfos 与
+// FetchGlobalModels 共享缓存，不会触发第二次上游探测）。
 // GlobalEnabled=false 时 modelList 已不进入本分支（逃生门在调用方 gate）。
-func (h *Handler) fetchGlobalModels() []string {
+func (h *Handler) fetchGlobalModels() ([]string, *auth.Auth) {
 	acct := h.cfg.Pool.PickExcludingForRealm(nil, "", "global")
 	if acct == nil {
-		return globalModels
+		return globalModels, nil
 	}
-	return h.cfg.Upstream.FetchGlobalModels(acct)
+	return h.cfg.Upstream.FetchGlobalModels(acct), acct
 }
 
 // rewriteModel 把 outbound chat body 的 model 字段替换为 bare（保留其余字段原样）。
@@ -330,8 +449,9 @@ func (h *Handler) fetchDynamicModels() []upstream.ModelInfo {
 	}
 	infos, err := h.cfg.Upstream.FetchModels(acct)
 	if err != nil || len(infos) == 0 {
-		// 拉取失败惩罚该账号，避免下次 Pick 又选中同一个反复失败；lastFail 保持全局负缓存。
-		h.cfg.Pool.NoteError(acct.UID)
+		// 拉取失败只进负缓存（5min lastFail），不 NoteError（P1-6/发现 6）：
+		// NoteError 喂的是 chat 熔断器，models 端点偶发 5xx 跨界惩罚 chat 通道
+		// 健康的账号；models 拉取失败 ≠ 账号 chat 不可用。
 		dynamicModelsCache.Lock()
 		dynamicModelsCache.lastFail = time.Now()
 		dynamicModelsCache.Unlock()
@@ -512,7 +632,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		// 占用在途名额：Pick 已跳过满额账号，此处 CAS 兜底并发抢名额的竞态。
 		if !h.cfg.Pool.Acquire(acct.UID) {
 			// 若被抢的正是粘性号，立即解绑并回落普通轮换，避免下一轮仍撞同一个
-			// 满载粘性号再浪费一次 PickByUID 往返（语义与 fail()/PickByUID-nil 的解绑一致）。
+			// 满载粘性号再浪费一次粘性命中往返（语义与 fail()/粘性命中-nil 的解绑一致）。
 			if stickyUID != "" && acct.UID == stickyUID {
 				unbindSticky()
 			}
@@ -593,6 +713,9 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		h.cfg.Pool.NoteSuccess(acct.UID)
+		// 11102 负缓存清命：该账号该模型实测成功，立即解除避让（不必等 TTL 到期）。
+		// BlockModelClear 按 "11102" reason 前缀识别，只清 11102 条目、不碰 6004 独立冷却。
+		h.cfg.Pool.BlockModelClear(acct.UID, bareModel)
 		// 粘性跟随最终成功号：本轮成功的账号成为该会话的粘性绑定（覆盖旧绑定）。
 		// 若 sticky 号失败、轮换到别的号成功，这里把会话重绑到新号，多轮对话下一跳不再随机抽。
 		if sessKey != "" && h.cfg.Session != nil {
@@ -670,9 +793,9 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 //
 // 七条路径，各司其职：
 //   - ErrHardCredit → CooldownUntilTomorrow4AM：即时硬冷却到次日 04:00（等签到恢复）。
-//   - ErrSoftRate → 默认 Cooldown(CoolSoft, soft_rate) 连续触发指数退避（封顶 soft_rate_max）；
-//     若上游 body 为模型级 6004 且带重置时间 → CooldownSoftForModel（until=重置墙钟，
-//     封顶 soft_rate_max，记录触发模型供切模型豁免）。
+//   - ErrSoftRate → 优先对齐上游重置墙钟（带「将在 … 重置」时 6004 走模型级豁免、
+//     非 6004 走账号级，均不指数堆加）；无重置时间才走有界退避（soft_rate 基数起、
+//     softStreak 翻倍、封顶 soft_rate_max，冷却中兜底探测不翻倍）。
 //   - ErrNotFound → Cooldown(CoolSoft, notFoundCooldown 固定 60s)：短冷却防雪崩，不随 soft_rate 退避。
 //   - ErrSessionDead → Disable：session 死亡，永久禁用（需人工重登）。
 //   - ErrContentBlocked → 不罚账号（无冷却/熔断/NoteError）；passthrough 首遇触发
@@ -680,6 +803,8 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 //   - ErrBadParams → 不罚账号（无冷却/熔断/NoteError，同 ErrContentBlocked 待遇），但仍轮转。
 //   - ErrServer → NoteError：喂单一连续失败计数器 fails + 累计错误 errTotal，
 //     达到 breakerThreshold 触发熔断（指数退避）。
+//   - ErrModelBlocked → BlockModelBackoff：(账号, 模型) 11102 负缓存避让（复用 modelCooldowns
+//     机制，Until=指数退避 TTL，选号侧 healthyForModel 避开，切模型即可用）。
 //   - 其他（default：ErrClient/ErrNone）→ 只换号不罚（防雪崩），不喂熔断。
 //
 // body 仅在 ErrSoftRate 分支用于识别上游 6004 模型级限流并解析重置时间；model 为请求
@@ -694,18 +819,24 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 		// 不需要异步核查（冗余）。立即换号。
 		h.cfg.Pool.CooldownUntilTomorrow4AM(uid, "余额不足")
 	case upstream.ErrSoftRate:
-		// 模型级 6004 且带「将在 … 重置」时间（issue #31）：冷却到上游明说的重置墙钟
-		// （封顶 soft_rate_max），记录触发模型 → 该账号对**其他模型**请求可豁免冷却。
-		// 解析失败（无时间文案 / 非 6004）→ 退回既有 600s 基数 + 指数退避现况。
-		if upstream.IsModelRateLimit(body) {
-			if resetAt, ok := upstream.ParseSoftRateReset(body); ok {
+		// 统一对齐上游重置时间（重构核心）：只要 body 带「将在 … 重置」，无论业务
+		// code 是 6004 还是 11140 rate-limiting 等形态，都精确冷却到该墙钟、绝不
+		// softStreak 指数堆加。
+		//   - 模型级（6004）→ CooldownSoftForModel：写 modelCooldowns[model]，切模型
+		//     豁免（既有 issue #31 语义）。
+		//   - 账号级（非 6004）→ CooldownSoftRate：写账号级 until，不产生模型豁免
+		//     （普通账号级限流不该因切模型绕过）。
+		if resetAt, ok := upstream.ParseRateReset(body); ok {
+			if upstream.IsModelRateLimit(body) {
 				h.cfg.Pool.CooldownSoftForModel(uid, h.cfg.SoftCooldown, resetAt, model, "6004 model rate limit")
 				return
 			}
+			h.cfg.Pool.CooldownSoftRate(uid, h.cfg.SoftCooldown, resetAt, "429 rate limit")
+			return
 		}
-		// 其余 soft_rate：软冷却基数来自 soft_rate（默认 600s）；同一账号连续触发时
-		// pool 内部按 softStreak 指数退避并封顶 soft_rate_max。
-		h.cfg.Pool.Cooldown(uid, pool.CoolSoft, h.cfg.SoftCooldown, "429 rate limit")
+		// 无重置时间 → 账号级有界退避（soft_rate 基数起、softStreak 翻倍、封顶
+		// soft_rate_max）；已在冷却中的兜底探测不翻倍（见 CooldownSoftRate）。
+		h.cfg.Pool.CooldownSoftRate(uid, h.cfg.SoftCooldown, time.Time{}, "429 rate limit")
 	case upstream.ErrSessionDead:
 		h.cfg.Pool.Disable(uid, "12153 session dead")
 	case upstream.ErrNotFound:
@@ -738,6 +869,12 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 		// 有问题（网关截断已由 413 消灭，剩余为客户端畸形 JSON）。换了账号照样 400，
 		// 不罚账号（无冷却/熔断/NoteError，同 ErrContentBlocked 待遇）；但**仍然轮转**
 		// ——不同账号可能有不同的模型权限，值得换号再试一次。
+	case upstream.ErrModelBlocked:
+		// 11102「该后端无此模型」：(账号, 模型) 负缓存避让。复用 modelCooldowns 机制
+		// （与 6004 同域），写 modelCooldowns[model]，Until 为指数退避 TTL（6h 起、封顶
+		// 24h）。选号侧 healthyForModel 对该账号自动避开该模型；切模型/切账号即可用。
+		// 立即换号（本轮 continue），该账号该模型冷却，下次选号避开。
+		h.cfg.Pool.BlockModelBackoff(uid, model, upstream.ModelBlockReason)
 	default:
 		// 其余（ErrClient/ErrNone）：只换号不罚（防雪崩），不喂熔断。
 	}

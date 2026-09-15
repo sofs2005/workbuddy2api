@@ -53,8 +53,10 @@ type apiEnvelope struct {
 	Data json.RawMessage `json:"data"`
 }
 
-// doJSON 发一次请求并拆 {code,msg,data} 信封：HTTP >=400、重定向、信封解析失败、
-// code!=0 均归为 error（返回的 status 供调用方区分网络层/业务层）。
+// doJSON 发一次请求并拆 {code,msg,data} 信封：HTTP >=400、重定向、body 读失败、
+// 信封解析失败、code!=0 均归为 error（返回的 status 供调用方区分网络层/业务层）。
+// body 读失败单独成 "read body" 错误（上游 P0-2 修复）：半截 body 不进 Unmarshal，
+// 否则会伪装成 "parse failed" 把网络中断误指为上游格式问题。
 func doJSON(client *http.Client, method, fullURL string, headers func(*http.Request), body io.Reader) (json.RawMessage, int, error) {
 	req, err := http.NewRequest(method, fullURL, body)
 	if err != nil {
@@ -71,7 +73,11 @@ func doJSON(client *http.Client, method, fullURL string, headers func(*http.Requ
 		return nil, 0, err
 	}
 	defer resp.Body.Close()
-	raw, _ := io.ReadAll(resp.Body)
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		// 读失败 → 传输层错误：半截 body 不进 Unmarshal（避免误报 parse failed）。
+		return nil, resp.StatusCode, fmt.Errorf("read body: %w", err)
+	}
 	if resp.StatusCode >= 400 {
 		return nil, resp.StatusCode, fmt.Errorf("http_error: upstream %d", resp.StatusCode)
 	}

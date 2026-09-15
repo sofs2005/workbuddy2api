@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -24,6 +25,8 @@ func TestClassify(t *testing.T) {
 		{402, ``, ErrHardCredit},
 		{400, `{"code":1,"msg":"余额不足"}`, ErrHardCredit},
 		{403, `insufficient credits`, ErrHardCredit},
+		{403, `credits exhausted`, ErrHardCredit},
+		{200, `{"code":1,"msg":"credits exhausted, please top up"}`, ErrHardCredit},
 		{200, `{"code":10001,"msg":"积分不足，请充值"}`, ErrHardCredit},
 		{400, `{"code":1,"msg":"额度用尽"}`, ErrHardCredit},
 		{429, ``, ErrSoftRate},
@@ -67,6 +70,14 @@ func TestClassify(t *testing.T) {
 		{500, `boom`, ErrServer},
 		{503, `unavailable`, ErrServer},
 		{200, ``, ErrNone},
+		// 11102「该后端无此模型」：确定性答复，归 ErrModelBlocked（(账号,模型) 负缓存避让）。
+		{404, `{"code":11102,"msg":"model [deepseek-v3-2-volc] service info not found"}`, ErrModelBlocked},
+		{400, `{"error":{"code":"11102","message":"model service info not found"}}`, ErrModelBlocked},
+		{400, `{"msg":"service info not found"}`, ErrModelBlocked},
+		// 11102 撞在 requestId 上不算（不得误避让可用模型）。
+		{404, `{"requestId":"11102","msg":"ok"}`, ErrNotFound},
+		// 429 + 11102 → 限流语义（ErrSoftRate），不是模型不存在。
+		{429, `{"code":11102,"msg":"service info not found"}`, ErrSoftRate},
 	}
 	for _, c := range cases {
 		if got := Classify(c.status, c.body); got != c.want {
@@ -124,8 +135,44 @@ func TestIsModelRateLimit(t *testing.T) {
 	}
 }
 
-// TestParseSoftRateReset 解析上游 429 6004 msg 里的「将在 … 重置」时间（## UTC+8）。
-func TestParseSoftRateReset(t *testing.T) {
+// TestIsModelBlocked 11102「该后端无此模型」判定：只认 code 精确等于 11102 或 msg 命中
+// 窄短语 "service info not found"，且仅在 400/404 下判。覆盖 reference 报告「11102 撞在
+// ID 上」的坑——requestId 里的 11102 不得误判。
+func TestIsModelBlocked(t *testing.T) {
+	cases := []struct {
+		status int
+		body   string
+		want   bool
+	}{
+		// 顶层 code 字段。
+		{404, `{"code":11102,"msg":"model [x] service info not found"}`, true},
+		// error 子对象 code 字段（OpenAI 信封形态）。
+		{400, `{"error":{"code":"11102","message":"model service info not found"}}`, true},
+		// msg 短语命中（无 code 字段）。
+		{400, `{"msg":"model service info not found"}`, true},
+		// 11102 撞在 requestId 上不算（reference converter test_model_site_blocks.py:55 同款）。
+		{404, `{"requestId":"11102","code":0,"msg":"ok"}`, false},
+		{400, `{"requestId":"11102","msg":"boom"}`, false},
+		// 429 带 11102 属限流语义，不算模型不存在。
+		{429, `{"code":11102,"msg":"service info not found"}`, false},
+		// 非 400/404 不算。
+		{500, `{"code":11102,"msg":"service info not found"}`, false},
+		// code 非 11102 且无短语 → 不算。
+		{404, `{"code":11103,"msg":"x"}`, false},
+		// 空 body 不算。
+		{404, ``, false},
+	}
+	for _, c := range cases {
+		if got := IsModelBlocked(c.status, c.body); got != c.want {
+			t.Errorf("IsModelBlocked(%d,%q)=%v want %v", c.status, c.body, got, c.want)
+		}
+	}
+}
+
+// TestParseRateReset 统一解析任意限流响应（6004 **和** 非 6004，如 11140 rate-limiting）
+// msg 里的「将在 … 重置」时间（UTC+8）。旧语义（非 6004 带时间 → false）是有意推翻的：
+// 11140 的 rate-limiting 变体带重置时间时同样应被精确对齐到上游重置墙钟。
+func TestParseRateReset(t *testing.T) {
 	future := time.Now().Add(35 * time.Minute)
 	ts := future.In(softRateResetLoc).Format("2006-01-02 15:04:05")
 	cases := []struct {
@@ -135,14 +182,14 @@ func TestParseSoftRateReset(t *testing.T) {
 	}{
 		{"6004 带时间+UTC+8 后缀", `{"code":6004,"msg":"将在 ` + ts + ` UTC+8 重置"}`, true},
 		{"6004 带时间无后缀", `{"code":6004,"msg":"将在 ` + ts + ` 重置"}`, true},
+		{"11140 rate-limiting 带时间(账号级也应对齐)", `{"code":11140,"msg":"The model provider is rate-limiting requests. 将在 ` + ts + ` UTC+8 重置"}`, true},
 		{"6004 无时间文案", `{"code":6004,"msg":"model usage limit exceeded"}`, false},
-		{"非 6004 但带时间（不是模型级）", `{"code":11140,"msg":"将在 ` + ts + ` UTC+8 重置"}`, false},
 		{"非法时间格式", `{"code":6004,"msg":"将在 明天 重置"}`, false},
 		{"空 body", ``, false},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			got, ok := ParseSoftRateReset(c.body)
+			got, ok := ParseRateReset(c.body)
 			if ok != c.ok {
 				t.Fatalf("ok=%v want %v (body=%s)", ok, c.ok, c.body)
 			}
@@ -630,5 +677,40 @@ func TestChatHTTPNilFallsBackToHTTP(t *testing.T) {
 	})
 	if c.chatHTTP() != c.HTTP {
 		t.Error("chatHTTP() should fall back to HTTP when ChatHTTP is nil")
+	}
+}
+
+// TestRateRegexesPrecompiledConcurrent 正则预编译为包级 var 后（P2-9，发现 8），
+// 两个限流判定函数在高并发下结果恒定。旧实现（函数体内 MustCompile）在此
+// 测试下同样通过（纯只读），该测试锁的是「预编译不改变语义」+ 并发安全，
+// 防止未来有人把包级 var 改回带状态的调用侧编译。
+func TestRateRegexesPrecompiledConcurrent(t *testing.T) {
+	const bodies = 50
+	const workers = 8
+	rlBody := `{"code":6004,"msg":"将在 2026-09-11 18:33:27 UTC+8 重置"}`
+	resetBody := `{"code":6004,"msg":"将在 2026-09-11 18:33:27 UTC+8 重置"}`
+
+	var wg sync.WaitGroup
+	errs := make(chan error, workers)
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < bodies; i++ {
+				if !IsModelRateLimit(rlBody) {
+					errs <- fmt.Errorf("IsModelRateLimit concurrent miss")
+					return
+				}
+				if _, ok := ParseRateReset(resetBody); !ok {
+					errs <- fmt.Errorf("ParseRateReset concurrent miss")
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for e := range errs {
+		t.Error(e)
 	}
 }

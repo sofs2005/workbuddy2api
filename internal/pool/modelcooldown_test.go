@@ -482,28 +482,146 @@ func TestHealthyForModelPriorityViaPick(t *testing.T) {
 	}
 }
 
-// TestModelCooldownsNotPersisted modelCooldowns 运行态、不持久化（重启清零）。
-func TestModelCooldownsNotPersisted(t *testing.T) {
+// TestModelCooldownsPersistRoundTrip modelCooldowns 现已持久化：落盘 → 重启 → 恢复。
+// 修复了 PR #96 后的回归窗口：6004 模型级冷却可长达数小时，跨重启是常态，
+// 不持久化等于每次重启都要重新踩一遍所有 6004 雷区（选号 healthyForModel 失忆）。
+// 只恢复 Until 在未来的条目，过期的惰性丢弃（见 TestModelCooldownsPersistExpiryFilter）。
+func TestModelCooldownsPersistRoundTrip(t *testing.T) {
 	dir := t.TempDir()
 	fp := dir + "/state.json"
 	p := New(fp)
 	p.Add(&auth.Auth{UID: "u1"})
-	p.CooldownSoftForModel("u1", time.Minute, time.Now().Add(5*time.Minute), "glm-5.3", "6004")
+	// 带解析时间 6004 → 写入 modelCooldowns[glm-5.3]，Until 在未来。
+	reset := time.Now().Add(5 * time.Minute)
+	p.CooldownSoftForModel("u1", time.Minute, reset, "glm-5.3", "6004 model rate limit")
+	p.Flush()
+
+	// 重启：重新从同一份 state.json 加载，modelCooldowns 应恢复。
+	p2 := New(fp)
+	p2.Add(&auth.Auth{UID: "u1"})
+	p2.mu.RLock()
+	mc, ok := p2.byUID["u1"].modelCooldowns["glm-5.3"]
+	p2.mu.RUnlock()
+	if !ok {
+		t.Fatal("重启后 modelCooldowns[glm-5.3] 缺失（持久化未恢复）")
+	}
+	if d := mc.Until.Sub(reset); d < -time.Second || d > time.Second {
+		t.Errorf("恢复后 model until=%v want ~reset=%v (diff %v)", mc.Until, reset, d)
+	}
+	if mc.ResetAt != mc.ResetAt || !mc.ResetAt.Equal(reset) {
+		t.Errorf("恢复后 model reset_at=%v want %v", mc.ResetAt, reset)
+	}
+	if mc.Reason != "6004 model rate limit" {
+		t.Errorf("恢复后 model reason=%q want %q", mc.Reason, "6004 model rate limit")
+	}
+}
+
+// TestModelCooldownsPersistExpiryFilter 恢复时做过期过滤：Only 在未来的条目恢复，
+// 过期的丢弃（惰性清理，防止重启后残留已过期的模型级冷却条目）。
+func TestModelCooldownsPersistExpiryFilter(t *testing.T) {
+	dir := t.TempDir()
+	fp := dir + "/state.json"
+	p := New(fp)
+	p.Add(&auth.Auth{UID: "u1"})
+	p.mu.Lock()
+	p.byUID["u1"].modelCooldowns = map[string]modelCooldown{
+		"future": {Until: time.Now().Add(time.Hour), ResetAt: time.Now().Add(2 * time.Hour), Reason: "6004 future"},
+		"past":   {Until: time.Now().Add(-time.Hour), ResetAt: time.Now().Add(-time.Hour), Reason: "6004 past"},
+		"zero":   {Until: time.Time{}, ResetAt: time.Time{}, Reason: "6004 zero"},
+	}
+	p.dirty.Store(true)
+	p.mu.Unlock()
+	p.Flush()
+
+	// 重启：past/zero 应被丢弃，只恢复 future。
+	p2 := New(fp)
+	p2.Add(&auth.Auth{UID: "u1"})
+	p2.mu.RLock()
+	mcs := p2.byUID["u1"].modelCooldowns
+	n := len(mcs)
+	_, futureOK := mcs["future"]
+	_, pastOK := mcs["past"]
+	_, zeroOK := mcs["zero"]
+	p2.mu.RUnlock()
+	if n != 1 || !futureOK {
+		t.Fatalf("恢复后 modelCooldowns=%+v want 仅 future 1 条", mcs)
+	}
+	if pastOK {
+		t.Error("过期条目 past 不应恢复")
+	}
+	if zeroOK {
+		t.Error("零值 Until 条目 zero 不应恢复")
+	}
+}
+
+// TestModelCooldownsPersistRestartSkipsCooled 重启场景：有 modelCooldowns → 落盘 →
+// 反序列化 → healthyForModel 正确跳过冷却中的模型（不再因重启失忆而撞 6004）。
+func TestModelCooldownsPersistRestartSkipsCooled(t *testing.T) {
+	dir := t.TempDir()
+	fp := dir + "/state.json"
+	p := New(fp)
+	p.Add(&auth.Auth{UID: "u1"})
+	p.SetCredits("u1", 1000)
+	// glm-5.3 在 6004 冷却中（5 分钟后恢复）。
+	p.CooldownSoftForModel("u1", time.Minute, time.Now().Add(5*time.Minute), "glm-5.3", "6004 model rate limit")
+	p.Flush()
+
+	// 重启：恢复后选号应跳过 glm-5.3（healthyForModel 返回 false）。
+	p2 := New(fp)
+	p2.Add(&auth.Auth{UID: "u1"})
+	p2.mu.RLock()
+	healthy := p2.byUID["u1"].healthyForModel(time.Now(), "glm-5.3")
+	otherHealthy := p2.byUID["u1"].healthyForModel(time.Now(), "hy3-x")
+	p2.mu.RUnlock()
+	if healthy {
+		t.Error("重启恢复后 healthyForModel(glm-5.3) 应 false（模型级冷却未失忆）")
+	}
+	if !otherHealthy {
+		t.Error("重启恢复后 healthyForModel(hy3-x) 应 true（切模型豁免保留）")
+	}
+}
+
+// TestCooldownSoftForModelResetNoZombieReason 带解析时间分支只写 modelCooldowns，
+// 不碰账号级 coolKind/reason 域（模型级冷却不该污染账号级 coolKind/reason）。
+// 修复 54 个号 state.json 残留「until=0001 零值 + reason=6004 model rate limit」的不一致快照。
+func TestCooldownSoftForModelResetNoZombieReason(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	// 先置一个账号级冷却（reason="429 rate limit"），再触发带解析时间的 6004。
+	p.Cooldown("u1", CoolSoft, time.Minute, "429 rate limit")
+	p.CooldownSoftForModel("u1", time.Minute, time.Now().Add(5*time.Minute), "glm-5.3", "6004 model rate limit")
+	p.mu.RLock()
+	coolKind := p.byUID["u1"].coolKind
+	reason := p.byUID["u1"].reason
+	p.mu.RUnlock()
+	// 重置时间分支不应覆盖账号级 coolKind/reason（正交）。
+	if coolKind != CoolSoft || reason != "429 rate limit" {
+		t.Errorf("重置分支污染账号级域: coolKind=%v reason=%q want CoolSoft/429 rate limit", coolKind, reason)
+	}
+}
+
+// TestPersistLazilyClearsZombieReason 落盘惰性清理僵尸 reason：账号级冷却过期后，
+// state.json 不再残留零值 until + reason 的不一致快照（仅当 until 在未来时才写出
+// cool_kind/reason）。
+func TestPersistLazilyClearsZombieReason(t *testing.T) {
+	dir := t.TempDir()
+	fp := dir + "/state.json"
+	p := New(fp)
+	p.Add(&auth.Auth{UID: "u1"})
+	// 无重置时间分支写 until+reason（账号级退避）。
+	p.CooldownSoftForModel("u1", time.Minute, time.Time{}, "", "6004 model rate limit")
+	// until 过期后落盘 → cool_kind/reason 应被惰性清理（不残留僵尸 reason）。
+	p.forceSoftExpired("u1")
 	p.Flush()
 	raw, err := os.ReadFile(fp)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(string(raw), "model_cooldowns") || strings.Contains(string(raw), "modelCooldowns") {
-		t.Errorf("state.json 不应持久化 modelCooldowns:\n%s", raw)
+	if strings.Contains(string(raw), "6004 model rate limit") {
+		t.Errorf("until 过期后 state.json 不应残留 zombie reason:\n%s", raw)
 	}
-	p2 := New(fp)
-	p2.Add(&auth.Auth{UID: "u1"})
-	p2.mu.RLock()
-	n := len(p2.byUID["u1"].modelCooldowns)
-	p2.mu.RUnlock()
-	if n != 0 {
-		t.Errorf("重载后 modelCooldowns=%d want 0（重启清零）", n)
+	if strings.Contains(string(raw), "\"cool_kind\":1") || strings.Contains(string(raw), "\"cool_kind\": 1") {
+		t.Errorf("until 过期后 state.json 不应残留 zombie cool_kind:\n%s", raw)
 	}
 }
 
@@ -527,5 +645,131 @@ func TestModelCooldownsPersistCompatOldState(t *testing.T) {
 	}
 	if until.IsZero() {
 		t.Error("旧文件 until 应照常加载（账号级冷却兼容）")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 11102「该后端无此模型」负缓存（复用 modelCooldowns 机制，BlockModelBackoff/Clear）
+// ---------------------------------------------------------------------------
+
+// TestBlockModelBackoffCooledAndExempt 11102 写 modelCooldowns[model]：该账号该模型被
+// 负缓存避让（healthyForModel=false），但其他模型豁免（账号级 healthy 仍真）——
+// 与 6004 豁免同域复用，语义「切模型即可用」。
+func TestBlockModelBackoffCooledAndExempt(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.BlockModelBackoff("u1", "deepseek-v3-2-volc", "11102 model not available")
+
+	p.mu.RLock()
+	e := p.byUID["u1"]
+	mc, ok := e.modelCooldowns["deepseek-v3-2-volc"]
+	untilZero := e.until.IsZero()
+	p.mu.RUnlock()
+
+	if !ok || mc.Until.IsZero() {
+		t.Fatalf("11102 应写入 modelCooldowns[model], got ok=%v mc=%+v", ok, mc)
+	}
+	if !untilZero {
+		t.Errorf("11102 不写账号级 until（切模型不绕过），until=%v", e.until)
+	}
+	// 触发模型被负缓存拦截（healthyForModel=false），其他模型豁免（账号级 healthy 仍真）。
+	if e.healthyForModel(time.Now(), "deepseek-v3-2-volc") {
+		t.Errorf("11102 后该模型应被负缓存拦截，但 healthyForModel 放行了")
+	}
+	if !e.healthyForModel(time.Now(), "glm-5.3") {
+		t.Errorf("11102 只锁触发模型，其他模型应仍可选")
+	}
+}
+
+// TestBlockModelBackoffExponentialTtl 11102 退避：首次 6h、二次 12h、封顶 24h。
+func TestBlockModelBackoffExponentialTtl(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+
+	p.BlockModelBackoff("u1", "m", "11102 model not available")
+	p.mu.RLock()
+	first := time.Until(p.byUID["u1"].modelCooldowns["m"].Until)
+	p.mu.RUnlock()
+	if d := first - modelBlockBaseTTL; d > time.Second || d < -time.Second {
+		t.Errorf("首次 TTL=%v want ~6h", first)
+	}
+
+	p.BlockModelBackoff("u1", "m", "11102 model not available")
+	p.mu.Lock()
+	mc := p.byUID["u1"].modelCooldowns["m"]
+	hits := mc.Hits
+	second := time.Until(mc.Until)
+	p.mu.Unlock()
+	if hits != 2 {
+		t.Errorf("hits=%d want 2", hits)
+	}
+	if d := second - 12*time.Hour; d > time.Second || d < -time.Second {
+		t.Errorf("二次 TTL=%v want ~12h", second)
+	}
+
+	// 连打到远超封顶：TTL 封顶 24h。
+	for i := 0; i < 10; i++ {
+		p.BlockModelBackoff("u1", "m", "11102 model not available")
+	}
+	p.mu.RLock()
+	capped := time.Until(p.byUID["u1"].modelCooldowns["m"].Until)
+	p.mu.RUnlock()
+	if d := capped - modelBlockMaxTTL; d > time.Second || d < -time.Second {
+		t.Errorf("封顶 TTL=%v want ~24h", capped)
+	}
+}
+
+// TestBlockModelClearOnly11102 成功清除只清 11102 条目，不碰 6004 独立冷却。
+func TestBlockModelClearOnly11102(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	now := time.Now()
+	p.CooldownSoftForModel("u1", time.Minute, now.Add(30*time.Minute), "glm-5.3", "6004 model rate limit")
+	p.BlockModelBackoff("u1", "deepseek-v3-2-volc", "11102 model not available")
+
+	p.BlockModelClear("u1", "deepseek-v3-2-volc")
+	p.mu.RLock()
+	_, blockedGone := p.byUID["u1"].modelCooldowns["deepseek-v3-2-volc"]
+	_, sixGone := p.byUID["u1"].modelCooldowns["glm-5.3"]
+	p.mu.RUnlock()
+	if blockedGone {
+		t.Errorf("BlockModelClear 后 11102 条目应清除")
+	}
+	if !sixGone {
+		t.Errorf("BlockModelClear 不得清除 6004 条目（glm-5.3 仍在冷却）")
+	}
+}
+
+// TestBlockModelClear6004NotClearedByPrefix 6004 条目 reason 前缀非 11102，Clear 不误删。
+func TestBlockModelClear6004NotClearedByPrefix(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.CooldownSoftForModel("u1", time.Minute, time.Now().Add(30*time.Minute), "m", "6004 model rate limit")
+	p.BlockModelClear("u1", "m") // Clear 不匹配 6004 reason
+	p.mu.RLock()
+	_, ok := p.byUID["u1"].modelCooldowns["m"]
+	p.mu.RUnlock()
+	if !ok {
+		t.Errorf("6004 条目不得被 BlockModelClear 删除")
+	}
+}
+
+// TestBlockModelBackoffPickSkips 11102 后选号器对该账号该模型避开（Pick 对 glm 豁免 u1 恢复）。
+func TestBlockModelBackoffPickSkips(t *testing.T) {
+	withNoPickGap(t)
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.Add(&auth.Auth{UID: "u2"})
+	p.SetCredits("u1", 1000)
+	p.SetCredits("u2", 1)
+	p.SetRandomSource(func(n int64) int64 { return 0 })
+	p.BlockModelBackoff("u1", "deepseek-v3-2-volc", "11102 model not available")
+	// 该模型请求应跳过 u1（u1 该模型被 11102 负缓存）、落到 u2。
+	if got := p.PickExcludingForRealm(nil, "deepseek-v3-2-volc", ""); got == nil || got.UID != "u2" {
+		t.Fatalf("11102 后该模型应跳过 u1, got %+v", got)
+	}
+	// 其他模型 u1 恢复可选（豁免保持）。
+	if got := p.PickExcludingForRealm(nil, "glm-5.3", ""); got == nil || got.UID != "u1" {
+		t.Fatalf("其他模型应豁免 u1, got %+v", got)
 	}
 }

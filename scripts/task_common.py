@@ -8,7 +8,6 @@
   - chat 域（copilot.tencent.com）：growth / tasks / buddy / streak / chat/completions
   - billing 域（www.codebuddy.cn）：/v2/report
   - accept : POST /v2/activity/growth/tasks/accept  {"task_codes":[code]}
-  - claim  : POST /v2/activity/growth/tasks/reward/claim {"task_code":code}
 """
 import json, os, time, glob, urllib.request, urllib.error
 
@@ -36,7 +35,6 @@ BILL_BASE = "https://www.codebuddy.cn"      # report / billing
 # growth 域常量（travel.go / report.go 与本次实测对齐）
 PATH_LIST_TASKS     = "/v2/activity/growth/tasks"
 PATH_ACCEPT_TASKS   = "/v2/activity/growth/tasks/accept"
-PATH_CLAIM_REWARD   = "/v2/activity/growth/tasks/reward/claim"
 PATH_BUDDY_FIRST    = "/activity/growth/buddy/first"
 PATH_BUDDY_AGREEMENT = "/activity/growth/buddy/agreement"
 PATH_STREAK         = "/activity/growth/streak"
@@ -63,7 +61,10 @@ def load_auth(uid_or_file: str) -> dict:
         if not hits:
             raise SystemExit(f"no auth for {pre}")
         p = hits[0]
-    d = json.load(open(p))
+    # encoding="utf-8" 必须显式指定：Windows 上 open() 默认用 locale 代码页
+    # （中文系统为 GBK），而 auth 文件是 UTF-8 写入的，非 ASCII 昵称会触发
+    # UnicodeDecodeError，使所有脚本类任务（school/cat/trial 等）直接中断。
+    d = json.load(open(p, encoding="utf-8"))
     a, acc = d["auth"], d["account"]
     realm = a.get("realm") or d.get("realm") or ""
     return {"token": a["accessToken"], "domain": a.get("domain") or "",
@@ -157,12 +158,6 @@ def accept_tasks(auth, task_codes) -> tuple:
     """POST accept 任务（not_accepted → accepted）。返回 (status, resp)。"""
     return do_post(auth, chat_base(auth), PATH_ACCEPT_TASKS,
                    {"task_codes": task_codes})
-
-
-def claim_reward(auth, task_code) -> tuple:
-    """POST claim 领取奖励（任务已 complete 后可领）。重复领返回业务错误，安全。"""
-    return do_post(auth, chat_base(auth), PATH_CLAIM_REWARD,
-                   {"task_code": task_code})
 
 
 def get_streak(auth) -> int:

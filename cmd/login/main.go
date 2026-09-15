@@ -43,8 +43,13 @@ import (
 // 单命令模式以 root 落盘时把产物 chown 给它，保证服务容器可读写 auths（token 续期要回写）。
 const appUID = 10001
 
-// 登录 state 落盘路径（var 便于测试替换临时文件；仅 url/poll 两段式使用）
-var stateFile = "/tmp/wb2api-login-state.json"
+// 登录 state 落盘路径（var 便于测试替换临时文件；仅 url/poll 两段式使用）。
+// 跨平台：os.TempDir() 在 Linux 解析为 /tmp（容器内行为不变），Windows 解析为
+// 系统临时目录，避免硬编码 /tmp 在 Windows 上 "The system cannot find the path"。
+// 注：上游常量（upstreamBaseCN / clientUA / originReferer* 等）在 oauth.go —— 本包
+// 把「跟上游说话」的 HTTP 层收在 oauth.go，main.go 只留 CLI 层（含 realmConfig 用的
+// base/origin 选择）。两文件同包，常量只声明一处。
+var stateFile = filepath.Join(os.TempDir(), "wb2api-login-state.json")
 
 // exitFunc 供测试替换（默认 os.Exit；测试持临时替换为 panic 以进程内捕获 fatal）。
 var exitFunc = os.Exit
@@ -86,6 +91,9 @@ func realmConfig(realm string) (base, origin string) {
 	}
 	return upstreamBaseCN, originRefererCN
 }
+
+// commonHeaders / apiEnvelope / doJSON 见 oauth.go（本包的 HTTP 端点层）。
+// main.go 只保留 CLI 层，避免同名符号两处声明。
 
 func fatal(format string, args ...any) {
 	fmt.Fprintf(os.Stderr, "login: "+format+"\n", args...)
@@ -194,6 +202,8 @@ func runPoll(base, origin, realm, statePath string, client *http.Client, out io.
 	if err := validateRealmMatch(ls.Realm, realm); err != nil {
 		fatal("%v", err)
 	}
+	// fetchToken 即上游内联的 handlePollLogin 逻辑（auth/token 权威登录状态端点 +
+	// login/account 取 uid），已抽到 oauth.go 供 runPoll / runOnce 共用。
 	tb, err := fetchToken(client, base, origin, ls.State)
 	if err != nil {
 		fatal("%v", err)
@@ -384,8 +394,9 @@ func main() {
 			return
 		}
 	}
-
 	base, origin := realmConfig(realm)
+	// newLoginClient（oauth.go）= 上游此处的 cookiejar + 30s 超时，每个流程独立 jar
+	// （多账号登录互不串会话）。
 	client := newLoginClient()
 
 	// 无子命令 = 单命令登录（容器内 `--entrypoint /app/login` 无参数直接可用）
