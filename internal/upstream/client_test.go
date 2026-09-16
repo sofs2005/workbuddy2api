@@ -78,6 +78,34 @@ func TestClassify(t *testing.T) {
 		{404, `{"requestId":"11102","msg":"ok"}`, ErrNotFound},
 		// 429 + 11102 → 限流语义（ErrSoftRate），不是模型不存在。
 		{429, `{"code":11102,"msg":"service info not found"}`, ErrSoftRate},
+		// 429 + 余额措辞 → 限流语义（fork-scan-absorb T-3，本次修复点）：限流响应
+		// body 高频携带 "quota exceeded"/"额度不足" 等跨计费/限流两界的措辞，
+		// hardRule 在 429 之前会误判 ErrHardCredit 硬冷却到次日 04:00，白扔号约 12h。
+		// 状态码是比关键词更权威的信号：真余额耗尽走 402，非 429 的 quota 措辞
+		// 仍归 hardRule（上方 {200,"quota exceeded"} 语义不变）。
+		{429, `quota exceeded`, ErrSoftRate},
+		{429, `{"code":1,"msg":"quota exceeded, please wait"}`, ErrSoftRate},
+		{429, `insufficient credits`, ErrSoftRate},
+		{429, `{"code":1,"msg":"额度不足"}`, ErrSoftRate},
+		{429, `积分不足，请充值`, ErrSoftRate},
+		// 429 + 账号级故障码防回归（accountFault 仍先于 429 判定）：429+14017 若
+		// 落到 status==429 兜底会误归 soft_rate，账号级故障等不来自愈。
+		{429, `{"code":14017,"msg":"trial not activated"}`, ErrAccountFault},
+		{429, `{"error":{"data":{"code":11140,"msg":"request illegal"}}}`, ErrAccountFault},
+		// WAF 403（P0-1）：403 + 无业务信封（无 "code":/"msg": 字段）→ ErrWafBlock。
+		// 空体 / HTML 拦截页 / 纯文本 / 非信封 JSON 均命中。
+		{403, ``, ErrWafBlock},
+		{403, `<html><body>403 Forbidden</body></html>`, ErrWafBlock},
+		{403, `Forbidden`, ErrWafBlock},
+		{403, `{"message":"blocked by waf"}`, ErrWafBlock},
+		{403, `<head><script>...</script></head><body>blocked</body>`, ErrWafBlock},
+		// 403 带业务信封的仍走既有分类（P0-1 约束：不劫持业务 403）。
+		{403, `{"code":11128,"msg":"blocked by security policy"}`, ErrContentBlocked},
+		{403, `{"code":60001,"msg":"quota exceeded"}`, ErrHardCredit},
+		{403, `{"code":1,"msg":"unknown business error"}`, ErrClient},
+		// 非 403 的无信封错误体不进 WAF 分类（WAF 判定绑定 403 形态）。
+		{400, `bad request`, ErrClient},
+		{429, ``, ErrSoftRate},
 	}
 	for _, c := range cases {
 		if got := Classify(c.status, c.body); got != c.want {
@@ -86,31 +114,149 @@ func TestClassify(t *testing.T) {
 	}
 }
 
-// TestContentBlockedClientMessage 内容拦截把上游 body 改写成防火墙口径：
-// 括号填分类关键词（由 body 抽出，抽不到回「违禁词」），绝不泄露上游 code/账号/upstream 字样。
-func TestContentBlockedClientMessage(t *testing.T) {
+// TestIsWafBlocked WAF 403 形态判定的直接回归（Classify 的第 7 层）：
+// 只认 403 + 无业务信封；带信封/其他状态码一律 false。
+func TestIsWafBlocked(t *testing.T) {
 	cases := []struct {
-		body    string
-		keyword string
+		status int
+		body   string
+		want   bool
 	}{
-		{`{"code":11128,"msg":"blocked by security policy"}`, "违禁词"},
-		{`{"code":"11128","msg":"blocked by security policy"}`, "违禁词"},
-		{`Illegal API invocation from an unapproved channel`, "违禁词"},
-		{`{"code":11128,"msg":"content contains NSFW material"}`, "nsfw"},
-		{`{"msg":"命中色情内容"}`, "色情"},
-		{`violence detected`, "violence"},
-		{"", "违禁词"},
+		{403, "", true},
+		{403, "<html>blocked</html>", true},
+		{403, `{"code":1}`, false},               // 有 "code": 字段
+		{403, `{"msg":"request illegal"}`, false}, // 有 "msg": 字段（且该文案本就该走 accountFault）
+		{402, "", false},                          // 非 403
+		{429, "", false},
+		{500, "<html>gateway</html>", false},
 	}
 	for _, c := range cases {
-		got := ContentBlockedClientMessage(c.body)
-		want := fmt.Sprintf("触发网站风控违禁词，无法调用模型：内容命中网关内容防火墙规则[%s]，已被拦截。请修改内容后重试。", c.keyword)
-		if got != want {
-			t.Errorf("ContentBlockedClientMessage(%q)=\n%q\nwant %q", c.body, got, want)
+		if got := IsWafBlocked(c.status, c.body); got != c.want {
+			t.Errorf("IsWafBlocked(%d,%q)=%v want %v", c.status, c.body, got, c.want)
 		}
-		for _, leak := range []string{"11128", "account", "accounts", "账号", "upstream", "cooling", "no_healthy"} {
-			if strings.Contains(strings.ToLower(got), leak) {
-				t.Errorf("client message must not leak %q: %s", leak, got)
+	}
+}
+
+// TestParseRetryAfter P1-2：Retry-After / retry-after-ms / x-ratelimit-reset
+// 头解析（有效/缺失/非法三形态）。语义对齐 intl CLI parseRetryAfterMs /
+// parseRateLimitResetMs（头族与数字口径）。
+func TestParseRetryAfter(t *testing.T) {
+	t.Run("retry-after seconds", func(t *testing.T) {
+		h := http.Header{}
+		h.Set("Retry-After", "30")
+		if d, ok := ParseRetryAfter(h); !ok || d != 30*time.Second {
+			t.Fatalf("ParseRetryAfter(30)=%v,%v want 30s,true", d, ok)
+		}
+	})
+	t.Run("retry-after-ms", func(t *testing.T) {
+		h := http.Header{}
+		h.Set("Retry-After-Ms", "1500")
+		if d, ok := ParseRetryAfter(h); !ok || d != 1500*time.Millisecond {
+			t.Fatalf("ParseRetryAfter(1500ms)=%v,%v want 1.5s,true", d, ok)
+		}
+	})
+	t.Run("x-ratelimit-reset epoch seconds", func(t *testing.T) {
+		h := http.Header{}
+		h.Set("X-Ratelimit-Reset", fmt.Sprintf("%d", time.Now().Add(90*time.Second).Unix()))
+		d, ok := ParseRetryAfter(h)
+		if !ok || d < 80*time.Second || d > 100*time.Second {
+			t.Fatalf("ParseRetryAfter(epoch+90s)=%v,%v want ~90s", d, ok)
+		}
+	})
+	t.Run("x-ratelimit-reset epoch millis", func(t *testing.T) {
+		h := http.Header{}
+		h.Set("X-Ratelimit-Reset", fmt.Sprintf("%d", time.Now().Add(45*time.Second).UnixMilli()))
+		d, ok := ParseRetryAfter(h)
+		if !ok || d < 35*time.Second || d > 55*time.Second {
+			t.Fatalf("ParseRetryAfter(epochMilli+45s)=%v,%v want ~45s", d, ok)
+		}
+	})
+	t.Run("missing headers", func(t *testing.T) {
+		if d, ok := ParseRetryAfter(http.Header{}); ok || d != 0 {
+			t.Fatalf("missing headers must return 0,false, got %v,%v", d, ok)
+		}
+	})
+	t.Run("invalid values", func(t *testing.T) {
+		for _, v := range []string{"abc", "", "-5", "1.5", "0"} {
+			h := http.Header{}
+			h.Set("Retry-After", v)
+			if d, ok := ParseRetryAfter(h); ok {
+				t.Errorf("Retry-After=%q must be rejected, got %v", v, d)
 			}
+		}
+	})
+	t.Run("oversized sanity cap", func(t *testing.T) {
+		h := http.Header{}
+		h.Set("Retry-After", "999999") // > retryAfterSanity(2h)
+		if d, ok := ParseRetryAfter(h); ok {
+			t.Errorf("oversized Retry-After must fall back, got %v", d)
+		}
+	})
+	t.Run("expired reset epoch", func(t *testing.T) {
+		h := http.Header{}
+		h.Set("X-Ratelimit-Reset", fmt.Sprintf("%d", time.Now().Add(-time.Minute).Unix()))
+		if d, ok := ParseRetryAfter(h); ok {
+			t.Errorf("expired reset must be rejected, got %v", d)
+		}
+	})
+	t.Run("priority retry-after first", func(t *testing.T) {
+		h := http.Header{}
+		h.Set("Retry-After", "10")
+		h.Set("X-Ratelimit-Reset", fmt.Sprintf("%d", time.Now().Add(300*time.Second).Unix()))
+		if d, ok := ParseRetryAfter(h); !ok || d != 10*time.Second {
+			t.Fatalf("Retry-After must take priority, got %v,%v", d, ok)
+		}
+	})
+}
+
+// TestChatStreamErrorCarriesRetryAfter 端到端：上游 429 带 Retry-After 头时，
+// ChatStreamContext 返回的 *Error 信封携带解析后的 RetryAfter（P1-2 挂载点验收）。
+func TestChatStreamErrorCarriesRetryAfter(t *testing.T) {
+	c := testClient(func(r *http.Request) (*http.Response, error) {
+		resp := jsonResp(429, `{"code":1,"msg":"rate limit"}`)
+		resp.Header.Set("Retry-After", "77")
+		return resp, nil
+	})
+	_, _, _, err := c.ChatStream(&auth.Auth{AccessToken: "at", UID: "u1"}, []byte(`{}`), "", ChatMeta{})
+	var ue *Error
+	if !errors.As(err, &ue) {
+		t.Fatalf("want *Error, got %v", err)
+	}
+	if ue.Kind != ErrSoftRate {
+		t.Fatalf("kind=%v want soft_rate", ue.Kind)
+	}
+	if ue.RetryAfter != 77*time.Second {
+		t.Fatalf("RetryAfter=%v want 77s", ue.RetryAfter)
+	}
+}
+
+// TestChatStreamErrorRetryAfterAbsent 头缺失时 RetryAfter 零值（回落调用方计算）。
+func TestChatStreamErrorRetryAfterAbsent(t *testing.T) {
+	c := testClient(func(r *http.Request) (*http.Response, error) {
+		return jsonResp(429, `{"code":1,"msg":"rate limit"}`), nil
+	})
+	_, _, _, err := c.ChatStream(&auth.Auth{AccessToken: "at", UID: "u1"}, []byte(`{}`), "", ChatMeta{})
+	var ue *Error
+	if !errors.As(err, &ue) || ue.Kind != ErrSoftRate {
+		t.Fatalf("want *Error{soft_rate}, got %v", err)
+	}
+	if ue.RetryAfter != 0 {
+		t.Fatalf("RetryAfter=%v want 0 (absent header)", ue.RetryAfter)
+	}
+}
+
+// TestClassifyContentBlocked 内容拦截分类仍由 Classify 负责（error-passthrough 后
+// 固定文案生成器已删除，分类仍按 contentBlockedRule 识别内容审核——识别是为了不罚号
+// 与降级重试，客户端文案改为直接透传上游原文）。
+func TestClassifyContentBlocked(t *testing.T) {
+	for _, body := range []string{
+		`{"code":11128,"msg":"blocked by security policy"}`,
+		`{"code":"11128","msg":"blocked by security policy"}`,
+		`Illegal API invocation from an unapproved channel`,
+		`{"code":11128,"msg":"Illegal API invocation from an unapproved channel"}`,
+	} {
+		if got := Classify(400, body); got != ErrContentBlocked {
+			t.Errorf("Classify(400, %q)=%v want ErrContentBlocked", body, got)
 		}
 	}
 }
@@ -377,10 +523,12 @@ func TestChatStreamHardCreditError(t *testing.T) {
 	if status != 402 {
 		t.Errorf("status=%d", status)
 	}
-	if err != nil {
-		t.Fatalf("hard credit should return body via status, not err: %v", err)
+	// 错误路径返回已分类的 *Error 信封（WAF 403 修复后的新契约），
+	// 同时 respBody 原样返回（错误透传语义不变）。
+	var ue *Error
+	if !errors.As(err, &ue) || ue.Kind != ErrHardCredit {
+		t.Fatalf("hard credit should return classified *Error, got %v", err)
 	}
-	// caller classifies via returned body
 	if Classify(status, string(respBody)) != ErrHardCredit {
 		t.Errorf("body=%q not classified hard credit", respBody)
 	}
@@ -636,8 +784,53 @@ func TestNewChatClientNoTotalTimeoutAndSharedTransport(t *testing.T) {
 	if !ok {
 		t.Fatalf("Transport type=%T", c.ChatHTTP.Transport)
 	}
-	if htr.ResponseHeaderTimeout != 120*time.Second {
-		t.Errorf("ResponseHeaderTimeout=%v want 120s", htr.ResponseHeaderTimeout)
+	// 连接层加固后 New() 的缺省 ResponseHeaderTimeout=60s（详断言见
+	// TestNewTransportHardening；SSE 长流不受影响——该超时只计首包前）。
+	if htr.ResponseHeaderTimeout != 60*time.Second {
+		t.Errorf("ResponseHeaderTimeout=%v want 60s", htr.ResponseHeaderTimeout)
+	}
+}
+
+// TestNewTransportHardening 连接层加固配置断言（transport.go 集中参数的回读验证）：
+// 真正禁 h2 / Dial 超时与 keepalive / TLS 握手超时 / ResponseHeaderTimeout 收紧。
+// 挂在 New() 的成品 Transport 上（而非 newTransport() 裸返回）——同一对象同时被
+// HTTP 与 ChatHTTP 持有，任何字段断言都直接对应生产出站行为。
+func TestNewTransportHardening(t *testing.T) {
+	tr, ok := New().ChatHTTP.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("Transport type=%T", New().ChatHTTP.Transport)
+	}
+	// 1. 真正禁 h2：TLSNextProto 必须是「非 nil 且不含 h2」的空映射。
+	//    nil = 标准库注入默认 h2 映射（ForceAttemptHTTP2 陷阱，见 transport.go）。
+	if tr.TLSNextProto == nil {
+		t.Fatal("TLSNextProto must be non-nil empty map to disable HTTP/2 (nil = stdlib re-enables h2)")
+	}
+	if _, registered := tr.TLSNextProto["h2"]; registered {
+		t.Error("TLSNextProto must not register h2")
+	}
+	if len(tr.TLSNextProto) != 0 {
+		t.Errorf("TLSNextProto must be empty, got %d entries", len(tr.TLSNextProto))
+	}
+	// 2. DialContext 超时与 keepalive：无法直接回读 Dialer 字段（Transport 只存
+	//    闭包），行为由 transport_test.go 的拨号计时测试验证。
+	// 3. TLS 握手超时（现役此前缺失）。
+	if tr.TLSHandshakeTimeout != 10*time.Second {
+		t.Errorf("TLSHandshakeTimeout=%v want 10s", tr.TLSHandshakeTimeout)
+	}
+	// 4. ResponseHeaderTimeout 收紧（120s → 60s，语义：只计首包前，SSE 长流不受影响）。
+	if tr.ResponseHeaderTimeout != 60*time.Second {
+		t.Errorf("ResponseHeaderTimeout=%v want 60s", tr.ResponseHeaderTimeout)
+	}
+	// 5. 空闲连接池（既有值，从 90s 收到 30s）。
+	if tr.IdleConnTimeout != 30*time.Second {
+		t.Errorf("IdleConnTimeout=%v want 30s", tr.IdleConnTimeout)
+	}
+	if tr.MaxIdleConns != 100 || tr.MaxIdleConnsPerHost != 20 {
+		t.Errorf("pool sizes=(%d, %d) want (100, 20)", tr.MaxIdleConns, tr.MaxIdleConnsPerHost)
+	}
+	// 6. DisableKeepAlives 必须保持 false：与连接复用意图相反，不吸收（报告说明）。
+	if tr.DisableKeepAlives {
+		t.Error("DisableKeepAlives must stay false (keep-alive reuse is intentional)")
 	}
 }
 
