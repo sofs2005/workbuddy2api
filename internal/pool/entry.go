@@ -46,6 +46,12 @@ type Status struct {
 	// 仅「带解析时间 6004」触发的模型级独立冷却（modelCooldowns 未到期条目）时非空，
 	// 每模型一行；运维据此看到"账号 A 的模型 X 还在限额中，预计 Z 时间恢复"。到期即消失（零回归）。
 	RateLimitedModels []RateLimitedModel `json:"rate_limited_models,omitempty"`
+	// ModelCosts 每模型实测成本台账（P1-anti-monopoly 可观测性）：运维据此自查
+	//「为什么总选它」——tier 0（免费）垄断 / tier 2 单价排序一眼可见。
+	// 仅 modelCostTTL 内的有效观测，每模型一行（cost_per_1k + last_seen +
+	// samples）；无观测/全部过期 → nil（tier 1 未知层）。过期即消失（零回归，
+	// 只读遍历零风险）。tier 不单独落字段（可由 per1k≤0 推出，零冗余）。
+	ModelCosts []ModelCostStatus `json:"model_costs,omitempty"`
 	Disabled          bool               `json:"disabled"`
 	DisabledReason    string             `json:"disabled_reason,omitempty"` // 仅 disabled 账号：禁用原因（运维可见）
 	SuccessCount      int64              `json:"success_count,omitempty"`
@@ -76,6 +82,19 @@ type RateLimitedModel struct {
 	Reason string `json:"reason,omitempty"`
 }
 
+// ModelCostStatus 单个 (账号, 模型) 的成本台账行（P1-anti-monopoly 可观测性）。
+// tier 不单独落字段：cost_per_1k ≤ 0 即 tier 0（免费），> 0 即 tier 2（收费），
+// 无观测即 tier 1——由调用方/面板按值推出，避免双表示漂移。
+type ModelCostStatus struct {
+	Model string `json:"model"`
+	// CostPer1k 实测每千 token 单价（EMA 平滑值）。≤0 = 实测免费（tier 0）。
+	CostPer1k float64 `json:"cost_per_1k"`
+	// LastSeen 最近一次观测时刻（过期即从台账消失，同 modelCostTTL 口径）。
+	LastSeen time.Time `json:"last_seen"`
+	// Samples 累计观测次数（EMA 收敛度参考）。
+	Samples int `json:"samples,omitempty"`
+}
+
 type entry struct {
 	a       *auth.Auth
 	credits int64
@@ -86,18 +105,11 @@ type entry struct {
 	// 签到之间第四因子（weightOf ×8）不应失忆——签到 09:00/21:00 定期刷新，
 	// 窗口外重启会丢快过期积分偏好，可能让奖励积分到期作废。
 	creditsExpiring int64
-	successCount    int64 // 累计成功
-	errTotal        int64 // 累计错误（终身累计，供状态展示与 EMA 反推；选号权重改用下方 EMA）
-	// successEMA / errorEMA 成功率的 EMA 观测（替代终身累计比率做选号权重）：
-	// 旧口径 successCount/(successCount+errTotal) 终身不衰减——历史故障永久压低
-	// 权重、长寿账号区分度收敛。EMA 让近期行为主导（成功事件拉 successEMA、错误
-	// 事件拉 errorEMA，比率 = successEMA/(successEMA+errorEMA)）。alpha=0.1
-	// （比 NoteModelCost 的 0.3 更平滑——选号权重不应被单次成败主导）。
-	// 持久化（stateAccount.SuccessEMA/ErrorEMA）；旧 state.json 缺字段时从
-	// successCount/errTotal 反推初始值（向后兼容）。
-	successEMA float64
-	errorEMA   float64
-	lastErr         time.Time // 最近一次错误时间
+	successCount    int64     // 累计成功
+	// errTotal 累计错误（终身累计，仅状态展示用；选号权重不消费——原「成功率」
+	// 因子已删，见 pick.weightOf 注释与 success-ema-review）。
+	errTotal    int64         // 累计错误（终身累计，供状态展示；选号权重不消费，原成功率因子已删）
+	lastErr     time.Time     // 最近一次错误时间
 	lastSuccess     time.Time // 最近一次成功时间
 	coolKind        CoolKind
 	until           time.Time // 冷却截止（即时冷却：CoolSoft 429 / CoolHard 余额耗尽）
@@ -154,10 +166,11 @@ type entry struct {
 	// inFlight 单账号在途请求数（运行态，不持久化）。用 atomic 避免 Pick 热路径拿写锁。
 	inFlight atomic.Int64
 
-	// modelCost 实测扣费账本：model → 观测（运行态，不持久化）。
-	// 由每次成功请求的 usage.credit 折算而来（上游没有"按模型的用量"接口，
-	// get-user-resource 只给套餐级积分汇总，只能实测）。选号时据此把
-	// 「该模型上免费/便宜的号」排在前面。
+	// modelCost 实测扣费账本：model → 观测。由每次成功请求的 usage.credit
+	// 折算而来（上游没有"按模型的用量"接口，get-user-resource 只给套餐级积分
+	// 汇总，只能实测）。选号时据此把「该模型上免费/便宜的号」排在前面。
+	// 持久化（stateAccount.ModelCosts，P1-anti-monopoly）：重启后成本知识保留；
+	// 落盘/恢复按 modelCostTTL 惰性过滤，陈旧观测不复活（同 modelCooldowns 口径）。
 	modelCost map[string]modelCostEntry
 }
 
@@ -302,17 +315,14 @@ type stateAccount struct {
 	SuccessCount int64     `json:"success_count,omitempty"`
 	// err_total 累计错误计数。旧版 err_count（连续错误）仍可读：加载时映射到 err_total，
 	// 仅作一次性迁移，不再回写 err_count。
-	// 运维可见的运行态计数（err_total/soft_streak/session_dead_fails/credits_expiring/
-	// error_ema）不用 omitempty：零值缺失会让人误以为"没记录"，实际是零值被省略。
+	// 运维可见的运行态计数（err_total/soft_streak/session_dead_fails/credits_expiring）
+	// 不用 omitempty：零值缺失会让人误以为"没记录"，实际是零值被省略。
+	// 旧文件的 success_ema/error_ema 字段读取时被忽略（无害遗留，JSON 多余键
+	// 自然丢弃，不报错不迁移——原成功率 EMA 因子已删，见 success-ema-review §4）。
 	ErrTotal    int64     `json:"err_total"`
 	ErrCount    int       `json:"err_count,omitempty"` // 兼容旧文件的迁移源，仅读取
 	LastSuccess time.Time `json:"last_success,omitempty"`
 	LastErr     time.Time `json:"last_err,omitempty"`
-	// SuccessEMA / ErrorEMA 成功率的 EMA 观测（选号权重第 3 因子数据源，见
-	// entry.successEMA）。旧 state.json 缺字段 → 加载时从 successCount/errTotal
-	// 反推初始值（比率归一），向后兼容。
-	SuccessEMA float64 `json:"success_ema,omitempty"`
-	ErrorEMA   float64 `json:"error_ema"`
 	// SoftStreak 连续软冷却次数（软退避指数）。旧 state.json 缺此字段 → 零值，
 	// 退避从基数重新开始（向后兼容）。
 	SoftStreak int `json:"soft_streak"`
@@ -346,6 +356,12 @@ type stateAccount struct {
 	// 跨重启是常态；不持久化导致每次重启 healthyForModel 失忆、重新踩一遍
 	// 6004 雷区（选号撞限流号耗尽 MaxRotate → 429）。恢复时惰性过滤已过期条目。
 	ModelCooldowns map[string]stateModelCooldown `json:"model_cooldowns,omitempty"`
+	// ModelCosts 实测扣费账本（model → 单价观测，见 entry.modelCost）。持久化
+	// （P1-anti-monopoly）：重启后成本知识保留，限免/夜间免费的跨重启窗口不再
+	// 重新付学费探测。落盘/恢复均按 modelCostTTL 惰性过滤（6h 外不写不恢复——
+	// 陈旧价格不复活）；恢复侧剔除非法值（负 per1k/零 LastSeen 的结构破损条目）。
+	// 与运行态 modelCostEntry 字段一一对应（单一表示，内存与落盘同构不搞两套）。
+	ModelCosts map[string]stateModelCost `json:"model_costs,omitempty"`
 }
 
 // stateModelCooldown 单个 (账号, 模型) 的 6004 独立冷却持久化记录，与运行态
@@ -356,13 +372,21 @@ type stateModelCooldown struct {
 	Reason  string    `json:"reason,omitempty"`
 }
 
+// stateModelCost 单个 (账号, 模型) 的成本观测持久化记录，与运行态 modelCostEntry
+// 字段一一对应（CostPer1k/LastSeen/Samples），落盘/恢复往返无损（EMA 值随
+// JSON 浮点原样保留，往返不引入漂移）。
+type stateModelCost struct {
+	CostPer1k float64   `json:"cost_per_1k"`
+	LastSeen  time.Time `json:"last_seen"`
+	Samples   int       `json:"samples,omitempty"`
+}
+
 // modelCostTTL 成本观测的有效期。取 6 小时：既覆盖"夜间免费"这类时段性优惠的
 // 单次会话，又不至于让昨天的价格决定今天的选择——过期的免费观测若永久有效，
 // 白天会把已开始收费的号继续当成免费。
 const modelCostTTL = 6 * time.Hour
 
-// modelCostEntry 运行时成本账本（独立于持久化结构，避免账本污染 state.json；
-// 成本随上游活动变化，仅内存态，重启后重新学习）。
+// modelCostEntry 运行时成本账本（持久化镜像 stateModelCost 与其字段一一对应）。
 type modelCostEntry struct {
 	CostPer1k float64
 	LastSeen  time.Time
@@ -450,8 +474,3 @@ const (
 	defaultIdleWeightPerHour = 0.5
 	defaultIdleWeightMax     = 5.0
 )
-
-// successAlpha 成功率 EMA 的平滑系数。取 0.1：比 NoteModelCost 的 0.3 更平滑——
-// 选号权重不应被单次成败主导（约 10 次观测收敛），又能让「上游修复后的连续成功」
-// 在十几次请求内把权重拉回来（旧终身累计口径下历史错误是分母的永久部分，永不可恢复）。
-const successAlpha = 0.1

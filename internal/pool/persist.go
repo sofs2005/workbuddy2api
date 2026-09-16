@@ -148,17 +148,8 @@ func (p *Pool) applyAccountsLocked(accounts map[string]stateAccount) {
 		if expiring > s.Credits {
 			expiring = s.Credits
 		}
-		// 成功率 EMA：新字段直接恢复；旧 state.json 缺字段时从 successCount/errTotal
-		// 反推初始值（归一到 [0,1] 区间：EMA 初值 = 历史比率），向后兼容且不丢历史信号。
-		// 无任何记录（success_ema==error_ema==0 且计数为 0）保持零值 → weightOf 走
-		// 1.5 中性偏信任分支。
-		successEMA, errorEMA := s.SuccessEMA, s.ErrorEMA
-		if successEMA == 0 && errorEMA == 0 {
-			if obs := s.SuccessCount + errTotal; obs > 0 {
-				successEMA = float64(s.SuccessCount) / float64(obs)
-				errorEMA = float64(errTotal) / float64(obs)
-			}
-		}
+		// （旧文件的 success_ema/error_ema 字段在 stateAccount 已删除，读取时被
+		// JSON 解码自然忽略——无害遗留，不反推不迁移；成功率 EMA 因子已删。）
 		e := &entry{
 			a:                &auth.Auth{UID: uid}, // placeholder，Add 时会换成完整凭证
 			credits:          s.Credits,
@@ -168,8 +159,6 @@ func (p *Pool) applyAccountsLocked(accounts map[string]stateAccount) {
 			coolKind:         s.CoolKind,
 			successCount:     s.SuccessCount,
 			errTotal:         errTotal,
-			successEMA:       successEMA,
-			errorEMA:         errorEMA,
 			lastErr:          s.LastErr,
 			lastSuccess:      s.LastSuccess,
 			softStreak:       s.SoftStreak,
@@ -205,6 +194,29 @@ func (p *Pool) applyAccountsLocked(accounts map[string]stateAccount) {
 			}
 			if len(e.modelCooldowns) == 0 {
 				e.modelCooldowns = nil
+			}
+		}
+		// 恢复 modelCosts（P1-anti-monopoly）：按 modelCostTTL 惰性过滤（超 6h 的
+		// 按过期处理，回 tier 1 不复活陈旧知识）+ 非法值剔除（负 per1k / 零
+		// LastSeen 的结构破损条目不污染账本；state.json 手工脏数据防御）。
+		// 损坏更重的形态（整个文件非法 JSON）已在 load() 静默跳过，不崩溃。
+		if len(s.ModelCosts) > 0 {
+			e.modelCost = make(map[string]modelCostEntry, len(s.ModelCosts))
+			for m, smc := range s.ModelCosts {
+				if smc.LastSeen.IsZero() || smc.CostPer1k < 0 {
+					continue // 结构破损/非法值：剔除条目
+				}
+				if now.Sub(smc.LastSeen) > modelCostTTL {
+					continue // 过期：陈旧价格不复活（同落盘侧口径）
+				}
+				e.modelCost[m] = modelCostEntry{
+					CostPer1k: smc.CostPer1k,
+					LastSeen:  smc.LastSeen,
+					Samples:   smc.Samples,
+				}
+			}
+			if len(e.modelCost) == 0 {
+				e.modelCost = nil
 			}
 		}
 		p.byUID[uid] = e
@@ -329,6 +341,26 @@ func (p *Pool) stateOverviewLocked() stateFile {
 				mcs = nil
 			}
 		}
+		// 模型成本账本落盘（P1-anti-monopoly，复用既有落盘循环）：只写 LastSeen
+		// 在 modelCostTTL 内的条目（过期不写——落盘即清理，与恢复侧同口径），
+		// 避免陈旧价格跨重启复活。字段与运行态 modelCostEntry 一一对应。
+		var mcosts map[string]stateModelCost
+		if len(e.modelCost) > 0 {
+			mcosts = make(map[string]stateModelCost, len(e.modelCost))
+			for m, mc := range e.modelCost {
+				if mc.LastSeen.IsZero() || now.Sub(mc.LastSeen) > modelCostTTL {
+					continue // 已过期/零值：不落盘（惰性清理）
+				}
+				mcosts[m] = stateModelCost{
+					CostPer1k: mc.CostPer1k,
+					LastSeen:  mc.LastSeen,
+					Samples:   mc.Samples,
+				}
+			}
+			if len(mcosts) == 0 {
+				mcosts = nil
+			}
+		}
 		// 熔断器 breakerUntil + retryCount 落盘（惰性过滤：仅未过期才写出）。
 		// breakerUntil 已过期/零值时不写 breaker_until + retry_count——过期时退避
 		// 已无意义，保留 retryCount 是无用退避指数。与恢复侧过期过滤同口径。
@@ -360,8 +392,6 @@ func (p *Pool) stateOverviewLocked() stateFile {
 			CoolKind:         coolKind,
 			SuccessCount:     e.successCount,
 			ErrTotal:         e.errTotal,
-			SuccessEMA:       e.successEMA,
-			ErrorEMA:         e.errorEMA,
 			LastSuccess:      e.lastSuccess,
 			LastErr:          e.lastErr,
 			SoftStreak:       e.softStreak,
@@ -372,6 +402,7 @@ func (p *Pool) stateOverviewLocked() stateFile {
 			RetryCount:       retryCount,
 			CreditsExpiring:  e.creditsExpiring,
 			ModelCooldowns:   mcs,
+			ModelCosts:       mcosts,
 		}
 	}
 	return sf
