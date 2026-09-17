@@ -138,18 +138,26 @@ WorkBuddy2API 是一个自托管的 **OpenAI 兼容上游网关**，将 ```CodeB
 
 ```mermaid
 flowchart LR
-    Client["客户端 / SDK\nOpenAI 兼容请求"] --> H
+    Client["客户端 / SDK\nOpenAI 兼容请求"] --> ROOT
+    Browser["浏览器\n管理控制台"] --> ROOT
 
-    subgraph GWI["WorkBuddy2API 网关 :7863"]
+    subgraph GWI["WorkBuddy2API 网关 :7863（单进程单端口）"]
+        ROOT["根 mux\n/v1/* /status /healthz → 网关\n其余 → 面板"] --> H
+        ROOT --> PANEL
         H["HTTP Handler\n鉴权 · 提示词改写 · 轮转"] --> P
         H --> S
         P["账号池\n三因子加权 · 熔断 · 冷却 · 租约"] --> U
         S["会话粘性路由"] -.绑定镜像.-> REDIS
         T["定时调度\n签到 09/21 · 旅行 09/21 · 活跃地图 10 · 保活 22\n开学季 12 · 夜猫子 01"] --> P
         U["上游 Client\nChatHTTP 流式 · 短 RPC"]
+        PANEL["面板 panel/host\n仪表盘 · 账号 · 扫码 · 配置"]
+        W["账号目录监听\n每 5s 热加载"] -.-> P
     end
 
     P -. "读凭证 (0600)" .-> AUTH[("auths/*.json")]
+    PANEL -. "落盘 / 直读" .-> AUTH
+    PANEL -. "在线编辑" .-> CFG[("config.json")]
+    W -. "监视" .-> AUTH
     P -. "状态镜像" .-> REDIS[("Upstash Redis\n可选")]
     U -->|"chat/completions (SSE)"| CB["CodeBuddy\ncopilot.tencent.com"]
     U -->|"billing / auth / growth"| CB
@@ -217,9 +225,16 @@ login [--realm=cn|global] realm   # 交互式选域，stdout 只输出 cn|global
 
 #### 登录后
 
+**无需重启**。网关后台每 5 秒比对 `auths/` 目录，发现新凭证即自动重扫入池（见下方
+[使用内置面板](#使用内置面板) 的「账号热加载」）。新增账号后数秒内 `/status` 的
+`total` 就会增加：
+
 ```bash
-docker compose restart   # 重启服务加载新账号
+curl -s -H "Authorization: Bearer $API_KEY" http://localhost:7863/status
 ```
+
+> 旧版本需要 `docker compose restart` 才能加载新账号；热加载上线后已不再需要。
+> 若你确实想重启（例如改了 `config.json`），执行 `docker compose restart`。
 
 **启动服务**
 
@@ -239,7 +254,66 @@ docker compose up -d --build
 # 健康检查（无可用账号时 503）；service 字段用于确认打到的是本网关
 curl -s http://localhost:7863/healthz
 # {"healthy":2,"total":3,"service":"workbuddy2api"}
+
+# 面板已挂载（免登录可调，不含敏感信息）
+curl -s http://localhost:7863/api/session
 ```
+
+### 使用内置面板
+
+浏览器打开 `http://<服务器地址>:7863` 即可进入 Web 控制台（与 API 同端口，无需另开端口）。
+
+**首次登录**：用户名 `admin`，口令默认 `workbuddy`。
+
+> ⚠️ **请立刻修改默认口令**。面板能读到账号的 `accessToken` / `refreshToken`，等同于账号完全控制权。
+> 在 `docker-compose.yml` 里设置 `WBGUI_PASSWORD`，或登录后在「系统」页网页改密码（改后吊销全部会话）。
+> 公网部署**必须**置于 HTTPS 反向代理之后。
+
+**面板能做什么**
+
+| 页面 | 能力 |
+|---|---|
+| 📊 仪表盘 | 账号池可用 / 冷却 / 禁用计数、积分总览、在途与粘性会话、Token 过期预警 |
+| 👥 账号管理 | 全量账号表格、状态筛选、批量签到 / 刷新 / 查积分、单账号详情、手工导入凭证 |
+| ➕ 添加账号 | 网页 OAuth 授权（国内版 / 国际版），自动落盘并热加载，无需重启 |
+| 💬 聊天测试 | 动态模型下拉、流式 / 非流式、推理内容展示、token 用量与首字延迟 |
+| ⚙️ 网关配置 | `config.json` 分组表单或 JSON 源码双模式编辑，保存前自动备份 |
+| 🔧 系统 | 容器状态、面板运行信息、网页改口令、任务历史、客户端接入示例 |
+
+**账号热加载**
+
+面板扫码或导入的新凭证会在 **5 秒内自动进池**，无需重启容器：
+
+- 网关后台每 5 秒比对 `auths/` 目录指纹（文件名 + 大小 + 修改时间）；
+- 有变化即重新加载并同步账号池，已有账号的**积分 / 冷却 / 计数状态不受影响**；
+- 手工投放凭证文件、删除凭证文件同样生效。
+
+也可用 API 验证：
+
+```bash
+curl -s -H "Authorization: Bearer $API_KEY" http://localhost:7863/status | grep -o '"total":[0-9]*'
+```
+
+**面板配置（`WBGUI_*` 环境变量）**
+
+面板配置**只认环境变量**，不读面板自己的 JSON 文件——避免与网关的 `config.json` 混淆。
+在 `docker-compose.yml` 的 `environment:` 段设置：
+
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `WBGUI_PASSWORD` | `workbuddy` | 面板登录口令（**务必修改**） |
+| `WBGUI_USERNAME` | `admin` | 面板登录用户名 |
+| `WBGUI_SESSION_TTL` | `12h` | 会话有效期 |
+| `WBGUI_READ_ONLY` | `false` | `true` = 全局只读，关闭一切写操作（仅监控场景） |
+| `WBGUI_DANGEROUS_OPS` | `false` | `true` = 解锁删除账号、恢复配置备份等高危操作 |
+
+> 面板的 `listen` 字段在合并模式下**无效**——端口由网关的 `config.listen` 决定。
+> 面板的备份与登录凭据落在 `data/backups/`、`data/gui-credentials.json`（随 `./data` 卷持久化）。
+
+**已知限制**
+
+「请求统计」页依赖网关 `/v1/stats` 端点，本上游未提供，故该页默认隐藏
+（`panel/web/src/App.tsx` 的 `STATS_ENABLED`）；其余页面不受影响。
 
 ### 更新到最新版本
 
@@ -255,19 +329,33 @@ docker compose pull && docker compose up -d
 > chown -R 10001:10001 ./auths
 > ```
 >
-> 之后新增账号建议进**容器内**登录（`app` 自身落盘，属主即 10001，无需反复 chown；容器内无 docker CLI，完成后回宿主机重启）：
+> 之后新增账号**推荐直接用内置面板**（浏览器打开 `:7863` → 添加账号）：面板与网关同进程，
+> 落盘的凭证属主天然是 `10001`，无需反复 chown，且 5 秒内自动入池、无需重启。
+> 也可进容器登录：
 >
 > ```bash
-> docker compose exec -it wb2api bash -c './login.sh' && docker compose restart wb2api
+> docker compose exec -it wb2api bash -c './login.sh'
 > ```
 
 ### 源码构建
 
+面板（`panel/`）是 `git subtree` 引入的**独立 Go module**，根 module 通过
+`replace workbuddy2api-gui => ./panel` 引用它。因此测试要分两处跑，
+根 `go test ./...` **不会**进入 `panel/`：
+
 ```bash
-go build ./...
-go vet ./...
-go test ./...      # 完整测试套件
+go build ./... && go vet ./...
+go test ./internal/... ./cmd/...    # 网关测试
+cd panel && go test ./...           # 面板测试（独立 module）
+
 go run ./cmd/server -config config.json
+```
+
+**前端产物**：面板 UI 需先构建（产物 `panel/internal/webui/dist/` 不入库，
+仓库内只有占位页）。未构建时面板 API 照常可用，页面会显示「前端未构建」引导：
+
+```bash
+cd panel/web && npm ci && npm run build   # 产物落到 panel/internal/webui/dist
 ```
 
 构建二进制：
@@ -278,6 +366,26 @@ CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o signin_bin ./cmd/signin
 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o login ./cmd/login
 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o credit ./cmd/credit
 ```
+
+> 用 `docker compose up -d --build` 构建时无需手工构建前端 —— Dockerfile 的
+> 第一个阶段（`node:20-alpine`）会自动完成。
+
+### 同步面板上游（维护者）
+
+`panel/` 由 [`287775856/workbuddy2api-gui`](https://github.com/287775856/workbuddy2api-gui) 经
+git subtree 引入。拉取面板作者的新提交：
+
+```bash
+git subtree pull --prefix=panel https://github.com/287775856/workbuddy2api-gui.git master --squash
+```
+
+合并适配集中在两处，且都是**新增文件**（上游没有，故 pull 不会冲突）：
+
+- `panel/host/host.go` —— 面板装配包（不含 `internal` 段，宿主导入用）
+- `cmd/server/panel.go` / `cmd/server/reload.go` —— 路由合并与账号热加载
+
+对上游已有文件的改动仅 `cmd/server/main.go` 少量几行、`Dockerfile` 的前端构建阶段、
+`.dockerignore` / `.gitignore` 若干忽略项。
 
 ### 验证
 

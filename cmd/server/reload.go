@@ -100,10 +100,21 @@ func startAuthWatcher(ctx context.Context, authDir string, p *pool.Pool) func() 
 			after, _, _, _, _ := p.CountsDetailed()
 			last = sig
 
-			// 只在账号数变化时打日志，避免每次 token 回写都刷屏。
-			if before != after {
+			// 日志如实反映结果：
+			//   · 池大小变化 → 新增/剔除
+			//   · 池大小不变但磁盘文件数 > 池大小 → 有文件读不进来（多半是属主/权限，
+			//     例如宿主机以 uid 1000 落盘、容器以 10001 读），必须点出来，
+			//     否则用户会以为账号已加载而实际没有（auth.LoadDir 对不可读文件是静默跳过）。
+			//   · 其余 → 既有账号的凭证内容更新（token 刷新 / realm 回填）
+			switch {
+			case before != after:
 				log.Printf("账号目录变化：%d → %d 个账号（已热加载，无需重启）", before, after)
-			} else {
+			case len(auths) > after:
+				log.Printf("WARN: 账号目录有 %d 个凭证文件，但仅 %d 个载入池中——"+
+					"多半是文件属主/权限问题（网关以 uid %d 运行）。"+
+					"宿主机执行：chown -R 10001:10001 ./auths",
+					len(auths), after, os.Getuid())
+			default:
 				log.Printf("账号目录变化：%d 个账号凭证已更新（已热加载）", after)
 			}
 		}

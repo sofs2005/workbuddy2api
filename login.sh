@@ -350,13 +350,35 @@ PYEOF
 fi
 echo ""
 if docker ps --format '{{.Names}}' | grep -q "^${CONTAINER}$"; then
-    echo "重启 $CONTAINER 加载新账号..."
-    docker restart "$CONTAINER" >/dev/null
-    sleep 2
     # API_KEY 从 config.json 读取（该变量在脚本中未定义，fallback 仅为占位，不会通过鉴权）
     API_KEY=$(python3 -c "import json; print(json.load(open('config.json')).get('api_key',''))" 2>/dev/null)
-    COUNT=$(curl -s http://127.0.0.1:7863/status -H "Authorization: Bearer ${API_KEY:-test_key}" 2>/dev/null | python3 -c "import json,sys; print(len(json.load(sys.stdin).get('accounts',[])))" 2>/dev/null || echo "?")
-    echo "服务已重启，当前账号数: $COUNT"
+    read_count() {
+        curl -s http://127.0.0.1:7863/status -H "Authorization: Bearer ${API_KEY:-test_key}" 2>/dev/null \
+            | python3 -c "import json,sys; print(len(json.load(sys.stdin).get('accounts',[])))" 2>/dev/null || echo "?"
+    }
+    BEFORE=$(read_count)
+
+    # 网关内置账号目录监听（每 5s 比对 auths/），新凭证会自动入池，无需重启。
+    # 这里最多等 15s；等到即零停机完成，等不到再回退到重启（例如网关是旧版本、
+    # 或容器内是另一份 auths 挂载）。
+    echo "等待网关自动加载新账号（最多 15s，无需重启）..."
+    COUNT="$BEFORE"
+    for _ in $(seq 1 15); do
+        sleep 1
+        COUNT=$(read_count)
+        if [ "$COUNT" != "$BEFORE" ] && [ "$COUNT" != "?" ]; then
+            break
+        fi
+    done
+
+    if [ "$COUNT" != "$BEFORE" ] && [ "$COUNT" != "?" ]; then
+        echo "账号已自动加载（热加载），当前账号数: $COUNT"
+    else
+        echo "未在 15s 内检测到变化，回退为重启 $CONTAINER 加载新账号..."
+        docker restart "$CONTAINER" >/dev/null
+        sleep 2
+        echo "服务已重启，当前账号数: $(read_count)"
+    fi
 else
     echo "容器 $CONTAINER 未运行，auth 文件已保存，下次启动自动加载"
 fi
