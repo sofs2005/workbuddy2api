@@ -89,6 +89,19 @@ jobs:
             || { echo "::error::login binary failed"; exit 1; }
           echo "login binary ok"
 
+          # 面板与网关同端口：验证面板路由被正确挂载（/api/session 免登录可调）。
+          # 这条同时守住「面板把网关路由吞掉」与「面板装配失败被静默降级」两种回归。
+          body=$(curl -s --max-time 5 http://127.0.0.1:7863/api/session || true)
+          case "$body" in
+            *'"authenticated"'*) echo "panel ok: /api/session -> $body" ;;
+            *) echo "::error::panel not mounted: /api/session returned '$body'"; exit 1 ;;
+          esac
+          # 静态资源：前端产物未构建时只有占位页，这里确认真实产物已打包进镜像
+          curl -s --max-time 5 -o /dev/null -w '%{http_code}' \
+            http://127.0.0.1:7863/ | grep -q 200 \
+            || { echo "::error::panel index not served"; exit 1; }
+          echo "panel static ok"
+
       - name: Build and push
         id: push
         uses: docker/build-push-action@v6

@@ -1,9 +1,26 @@
 # syntax=docker/dockerfile:1
+# ── 阶段 1：面板前端 ────────────────────────────────────────────
+# 面板（panel/）是 git subtree 引入的独立 module，仓库里不含其前端产物
+# （dist/ 只有占位 index.html，真实 assets 被 gitignore），故必须构建。
+FROM node:20-alpine AS web
+WORKDIR /src
+# 先只拷 manifest，让依赖层可缓存（面板源码改动不触发重新 npm ci）。
+COPY panel/web/package.json panel/web/package-lock.json* ./panel/web/
+RUN cd panel/web && (npm ci --no-audit --no-fund || npm install --no-audit --no-fund)
+# 拷前端源码与 embed 占位目录（vite outDir 指向 ../internal/webui/dist）。
+COPY panel/web ./panel/web
+COPY panel/internal/webui/dist ./panel/internal/webui/dist
+RUN cd panel/web && npm run build
+
 FROM golang:1.26-alpine AS build
 WORKDIR /src
 COPY go.mod go.sum ./
+# replace 指向的本地 module 必须先存在，否则 go mod download 解析不到。
+COPY panel/go.mod ./panel/
 RUN go mod download
 COPY . .
+# 用前端阶段产出的真实 dist 覆盖源码树里的占位文件。
+COPY --from=web /src/panel/internal/webui/dist ./panel/internal/webui/dist
 # 一次编译全部二进制（工具进镜像，容器内可直接跑脚本）。全部 -trimpath -s -w。
 RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/wb2api ./cmd/server \
  && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/signin_bin ./cmd/signin \

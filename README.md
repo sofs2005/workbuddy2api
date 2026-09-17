@@ -32,14 +32,40 @@ WorkBuddy2API 是一个自托管的 **OpenAI 兼容上游网关**，将 ```CodeB
 ### 本项目不做什么
 
 - **只做上游网关，不做下游协议转换** — 本项目仅负责对接上游 ```CodeBuddy``` 并暴露 OpenAI Chat 协议；Anthropic Messages、Gemini 等其他协议的适配应由下游网关负责；
-- **不内嵌 Web 管理面板** — 网关核心保持精简，可视化面板作为独立项目维护，数据直取上游接口，不增加网关适配负担。
+- **不做多密钥分发 / 计费审计** — 面向个人多账号场景，不做下游密钥体系（每把密钥独立配额、IP 白名单、调用审计）。需要这类运营能力请用 [workbuddy-manager](https://github.com/ithtelab/workbuddy-manager)。
 
-### 社区前端面板
+### 内置 Web 管理面板
 
-需要 Web 管理面板的用户，可部署以下符合本理念的社区项目（独立维护，与网关解耦）：
+本项目已**内置** [workbuddy2api-gui](https://github.com/287775856/workbuddy2api-gui) 面板（经 `git subtree` 引入到 `panel/`），**与网关同进程、同端口**，无需单独部署第二个容器：
 
-- [workbuddy2api-gui](https://github.com/287775856/workbuddy2api-gui) — 账号池状态可视化面板
-- [workbuddy-manager](https://github.com/ithtelab/workbuddy-manager) — 账号管理工具
+| 路径 | 归属 |
+|---|---|
+| `/v1/*`、`/status`、`/healthz` | 网关（OpenAI 兼容接口与探活） |
+| `/api/*`、`/assets/*`、`/` | 面板（Web 控制台） |
+
+浏览器访问 `http://<地址>:7863` 即可打开控制台，功能包括：账号池仪表盘、扫码添加账号（国内版 / 国际版）、批量签到、实时积分查询、猫猫旅行、凭证导入、聊天测试台、网关配置在线编辑、Token 有效期预警。
+
+**账号热加载**：面板扫码落盘的新凭证会在数秒内自动进池，**无需重启容器**（网关后台每 5 秒比对 `auths/` 目录，变化即重扫；已有账号的积分 / 冷却 / 计数状态不受影响）。
+
+**配置分离**：网关配置仍是 `config.json`；面板配置**只认 `WBGUI_*` 环境变量**（面板自己的 `listen` 字段在合并模式下无效，端口由网关的 `config.listen` 决定）。常用变量：
+
+| 变量 | 说明 |
+|---|---|
+| `WBGUI_PASSWORD` | 面板登录口令（**默认 `workbuddy`，务必修改**） |
+| `WBGUI_USERNAME` | 面板登录用户名（默认 `admin`） |
+| `WBGUI_READ_ONLY` | `true` = 面板全局只读，关闭一切写操作 |
+| `WBGUI_DANGEROUS_OPS` | `true` = 解锁删除账号等高危操作（默认 false） |
+| `WBGUI_SESSION_TTL` | 会话有效期（默认 `12h`） |
+
+> ⚠️ **安全**：面板持有全部账号凭据（`accessToken` / `refreshToken`），且与 API 同端口暴露。
+> 部署后**第一件事就是改掉默认口令**，并置于 **HTTPS 反向代理**之后。危险操作开关默认关闭。
+
+> 面板的「请求统计」页依赖网关 `/v1/stats` 端点，本上游未提供该端点，故该页默认隐藏
+> （见 `panel/web/src/App.tsx` 的 `STATS_ENABLED`）；其余页面不受影响。
+
+### 其他社区面板
+
+- [workbuddy-manager](https://github.com/ithtelab/workbuddy-manager) — 账号管理 + 多密钥分发网关（独立部署，功能更重，适合对外提供 API）
 
 > ⚠️ 合规须知：本项目是**非官方**网关，使用 ```CodeBuddy``` 账号作为上游，**仅限本人授权账号、本机 / 私有环境测试**。详细边界见[安全与合规](#安全与合规)。
 

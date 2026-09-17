@@ -205,13 +205,26 @@ func main() {
 		GlobalEnabled: cfg.Global.Enabled,
 	})
 
+	// 单端口对外：网关 handler 与面板 handler 合成一个 mux（见 panel.go）。
+	// 装配失败不让网关跟着起不来 —— 面板是附属能力，降级为「仅网关」并明确告警。
+	rootHandler, err := newRootHandler(cfg, *cfgPath, h)
+	if err != nil {
+		log.Printf("WARN: [panel] 面板装配失败，本次仅提供网关接口: %v", err)
+		rootHandler = h
+	}
+
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	go sch.Run(ctx)
 
+	// 账号目录热加载：替代「重启网关容器」加载新账号（见 reload.go）。
+	// 面板扫码落盘后数秒自动进池，无需重启、零停机，也不必挂 docker.sock。
+	stopAuthWatch := startAuthWatcher(ctx, cfg.AuthDir, p)
+	defer stopAuthWatch()
+
 	srv := &http.Server{
 		Addr:              cfg.Listen,
-		Handler:           h,
+		Handler:           rootHandler,
 		ReadHeaderTimeout: 30 * time.Second,
 		// ReadTimeout 覆盖整个请求读取（含 body）：防慢速 body 拖死连接。
 		// max_body_mb 已移除（请求体无上限，交由上游自然响应），超大 body 成为

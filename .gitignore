@@ -19,6 +19,9 @@ config.json
 # Build artifacts
 *.tmp
 __pycache__/
+# Windows 下 `go build ./cmd/server` 会在仓库根留下 server.exe
+/server.exe
+/wb2api.exe
 
 # Backups (contains auth tokens)
 backups/
@@ -34,3 +37,9 @@ docs/
 # 设计/计划文档（但 README.md 必须进版本库）
 *.md
 !README.md
+# 面板（panel/，git subtree）是独立项目，其文档需随 subtree 一起进出，
+# 否则每次 pull 都会静默丢掉作者的 README / 文档更新。
+!panel/README.md
+!panel/**/*.md
+# panel/host 是合并时新增的装配包（非上游面板文件），其文档同样需要入库
+!panel/host/*.md
