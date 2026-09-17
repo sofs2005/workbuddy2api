@@ -910,3 +910,109 @@ func TestRateRegexesPrecompiledConcurrent(t *testing.T) {
 		t.Error(e)
 	}
 }
+
+// TestChatHeadersRacesRefreshToken 并发下 ChatHeaders 读 AccessToken 与 RefreshToken
+// 写 AccessToken 的数据竞争（auth.Auth.mu 未覆盖出站读取侧）。
+//
+// auth.Auth.mu 的既有契约只覆盖「RefreshToken 写 ↔ SaveAtomic 读」（见 auth.go 注释
+// 「mu 串行化 RefreshToken 写与 SaveAtomic 读，防止并发写回半更新 token」）。写侧确实
+// 全程持锁（RefreshToken 第 2 段：锁内写 AccessToken/RefreshToken/Domain/ExpiresAt），
+// 但**所有出站请求头构造**都是无锁直读 a.AccessToken：
+//   - Client.ChatHeaders（headers.go）
+//   - Client.BillingHeaders（headers.go）
+//   - Client.fetchEnterpriseModels / fetchV3Models（client.go）
+//   - Client.CommonHeaders（headers.go）
+//
+// 生产上这两侧真的会并发：Scheduler.RunKeepaliveNow 定时对**每个**非禁用账号调
+// RefreshToken（与该账号是否有在途请求无关），而 handler 正基于同一个 *auth.Auth
+// 指针构造 chat 请求头——Pool.AuthByUID/List 返回的就是池内同一个对象。
+// 本测试用 -race 复现该竞争；修复后应无告警。
+func TestChatHeadersRacesRefreshToken(t *testing.T) {
+	c := testClient(func(r *http.Request) (*http.Response, error) {
+		if !strings.HasSuffix(r.URL.Path, "/v2/plugin/auth/token/refresh") {
+			return nil, errors.New("wrong path: " + r.URL.Path)
+		}
+		// domain 也带非 global 值：让 RefreshToken 的 `a.Domain = tok.Domain` 真正执行，
+		// 从而使 ChatHeaders 分支里的 X-Domain 读取同样进入竞争面（否则该写入被
+		// `if tok.Domain != ""` 挡掉，Domain 竞争不可见）。
+		return jsonResp(200, `{"code":0,"data":{"accessToken":"newat","refreshToken":"newrt","domain":"chat.example.com","expiresIn":3600}}`), nil
+	})
+	a := &auth.Auth{AccessToken: "at", RefreshToken: "rt", ExpiresAt: 1}
+
+	var wg sync.WaitGroup
+	stop := make(chan struct{})
+
+	// 写侧：模拟 keepalive 周期刷新（在 a.mu 内改写 AccessToken/RefreshToken/Domain/ExpiresAt，
+	// 与请求流量无关）。
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			_ = c.RefreshToken(a)
+		}
+	}()
+
+	// 读侧：模拟在途请求构造出站头（读 AccessToken）。
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		req, err := http.NewRequest(http.MethodPost, "https://chat.example/v2/chat/completions", nil)
+		if err != nil {
+			t.Errorf("new request: %v", err)
+			close(stop)
+			return
+		}
+		for i := 0; i < 300; i++ {
+			c.ChatHeaders(req, a, "", ChatMeta{})
+			_ = req.Header.Get("Authorization")
+		}
+		close(stop)
+	}()
+
+	wg.Wait()
+}
+
+// TestRefreshTokenExpiresInSanityCap expiresIn 量级上限：上游脏值（如
+// 99999999999 秒 ≈ 3170 年）不得把 ExpiresAt 推到荒谬未来（NeedsRefresh 永假
+// → token 永不刷新反而真过期失效）。依据 pr134-watchlist-analysis.md #4 可选加固：
+// 上限 10 年（实测 R-D 响应恒 expiresIn=5184000=60d，10 年是纯防御量级）。
+// 超限按脏值处理：保留旧 ExpiresAt（与缺省分支同语义）。
+func TestRefreshTokenExpiresInSanityCap(t *testing.T) {
+	c := testClient(func(r *http.Request) (*http.Response, error) {
+		return jsonResp(200, `{"code":0,"data":{"accessToken":"newat","refreshToken":"newrt","expiresIn":99999999999}}`), nil
+	})
+	oldExpiry := time.Now().Add(time.Hour).Unix()
+	a := &auth.Auth{AccessToken: "at", RefreshToken: "rt", ExpiresAt: oldExpiry}
+	if err := c.RefreshToken(a); err != nil {
+		t.Fatalf("refresh: %v", err)
+	}
+	if a.ExpiresAt != oldExpiry {
+		t.Errorf("脏 expiresIn 应保留旧 ExpiresAt=%d, got %d（被推到荒谬未来）", oldExpiry, a.ExpiresAt)
+	}
+	// token 本身仍应写回（脏 expiresIn 只否决过期时间，不否决凭证）。
+	if a.AccessToken != "newat" || a.RefreshToken != "newrt" {
+		t.Errorf("tokens not updated: %+v", a)
+	}
+}
+
+// TestRefreshTokenExpiresInWithinCapApplied 正常量级（60d，实测 R-D 恒 5184000）
+// 不受上限影响：ExpiresAt 照常推进。
+func TestRefreshTokenExpiresInWithinCapApplied(t *testing.T) {
+	c := testClient(func(r *http.Request) (*http.Response, error) {
+		return jsonResp(200, `{"code":0,"data":{"accessToken":"newat","refreshToken":"newrt","expiresIn":5184000}}`), nil
+	})
+	a := &auth.Auth{AccessToken: "at", RefreshToken: "rt", ExpiresAt: 1}
+	before := time.Now().Unix()
+	if err := c.RefreshToken(a); err != nil {
+		t.Fatalf("refresh: %v", err)
+	}
+	want := before + 5184000
+	if a.ExpiresAt < want-2 || a.ExpiresAt > want+2 {
+		t.Errorf("ExpiresAt=%d want ~%d (60d 正常推进)", a.ExpiresAt, want)
+	}
+}

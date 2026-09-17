@@ -39,9 +39,11 @@ func (p *Pool) pick(tried map[string]bool, reqModel, realm string) *auth.Auth {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	now := time.Now()
-	// 惰性清理过期的 6004 模型级冷却（map 不无限膨胀；status 只读遍历跳过过期项）。
+	// 惰性清理过期的 6004 模型级冷却与成本台账（两者的 map 都不无限膨胀；
+	// status 只读遍历天然跳过过期项，但内存条目必须在此真正删除）。
 	for _, e := range p.byUID {
 		e.pruneExpiredModelCooldowns(now)
+		e.pruneExpiredModelCosts(now)
 	}
 	realmOK := func(e *entry) bool { return realm == "" || e.a.Realm() == realm }
 	healthyOf := func(e *entry) bool { return realmOK(e) && e.healthy(now) }
@@ -102,9 +104,37 @@ func (p *Pool) pick(tried map[string]bool, reqModel, realm string) *auth.Auth {
 		return 2, mc.CostPer1k
 	}
 	bestTier := 2
+	hasTier1 := false
+	explored := false // 本次 pick 是否切了探索层（事件日志在选中号确定后打）
 	for _, e := range cands {
 		if ti, _ := costTier(e); ti < bestTier {
 			bestTier = ti
+		}
+	}
+	// 条件探索（issue #136 方案 a′，语义契约七条见设计报告 §2.1）：tier 0 垄断层
+	// 存在（bestTier==0 且 reqModel 非空）且候选含 tier 1（冻结存在）且距上次
+	// 探索 ≥ 窗口（零值 timer=从未探索→首次满足即探）时，本次 pick 生效层切
+	// tier 1-only——探索=搭车改道，把一个既有真实用户请求改道给未知号（零新增
+	// 上游请求；IP 维度零增量，WAF 友好）。成功 → NoteModelCost 首观测 → 毕业
+	// （tier 0/2，下一轮 pick 立即生效）；失败 → 既有错误策略照常，无探测风暴。
+	// hasTier1 复用本循环上方 costTier 的预计算口径（每候选一次的契约不变）——
+	// 下方 ws 构建循环顺带置位，不在判定处再算一遍。timer 同锁写入：并发 pick
+	// 串行进入写锁，只有一个进入者能通过窗口判定（天然防重复探索）。
+	// key = realm + "\x1f" + reqModel：同模型名可跨域，探索节奏按 (域, 模型)
+	// 独立；realm==""（Pick 老语义）单独成键。
+	if p.costExploreInterval > 0 && bestTier == 0 && reqModel != "" {
+		for _, e := range cands {
+			if ti, _ := costTier(e); ti == 1 {
+				hasTier1 = true
+				break
+			}
+		}
+		key := realm + "\x1f" + reqModel
+		if hasTier1 && now.Sub(p.exploreLast[key]) >= p.costExploreInterval {
+			p.exploreLast[key] = now
+			p.costExploreEvents++
+			bestTier = 1
+			explored = true
 		}
 	}
 	ws := make([]weighted, 0, len(cands))
@@ -182,6 +212,13 @@ func (p *Pool) pick(tried map[string]bool, reqModel, realm string) *auth.Auth {
 	} else {
 		e = p.pickWeighted(eligible) // eligible 保序 = top5 降序子集，权重直接用预计算值
 	}
+	if explored {
+		// 探索事件日志（§5 可观测性）：选中号此时才确定，故在选中点打出。
+		// 毕业结果由相邻的既有日志闭环（免费号无日志、收费号走 NoteModelCost
+		// 常规路径）。
+		log.Printf("[pool] cost explore model=%s realm=%q acct=%s window=%s",
+			reqModel, realm, logfmt.Label(e.a.UID, e.a.Nickname), p.costExploreInterval)
+	}
 	e.lastUsed = now // 锁内即时标记：下一个进入 pick 的 goroutine 立即看到本号已用
 	p.pickSeq++
 	e.usedSeq = p.pickSeq // 单调序号：保证 usedSeq 严格全序（防惊群/LRU 的权威依据）
@@ -221,8 +258,14 @@ func (p *Pool) pickEarliestExpiryLocked(tried map[string]bool, now time.Time, re
 	if best == nil {
 		return nil
 	}
-	log.Printf("WARN: [pool] fallback_earliest_expiry uid=%s until=%s kind=%s", logfmt.UID8(best.a.UID), best.expiry(now).Format(time.RFC3339), best.fallbackKind(now))
+	log.Printf("WARN: [pool] fallback_earliest_expiry acct=%s until=%s kind=%s", logfmt.Label(best.a.UID, best.a.Nickname), best.expiry(now).Format(time.RFC3339), best.fallbackKind(now))
 	best.lastUsed = time.Now()
+	// 兜底同样是「选中」，必须与 pick() 正常路径、粘性命中路径（PickByUIDForModel）
+	// 一样推进 usedSeq/pickSeq：否则被兜底反复选中的账号 usedSeq 恒为 0，在 pick 的
+	// LRU 兜底（按 usedSeq 取最旧）眼里永远是「最旧」，刚被用过就被立刻再选——
+	// 防集中/防惊群失效（entry.usedSeq 契约：每次被选中时取 p.pickSeq 自增值）。
+	p.pickSeq++
+	best.usedSeq = p.pickSeq
 	return best.a
 }
 
@@ -347,5 +390,3 @@ func (p *Pool) weightOf(e *entry, maxCredits int64, now time.Time) float64 {
 	// 100% 同源——机制名存实亡且冗余，删除后 weightOf 为三因子。）
 	return w
 }
-
-// SetCredits 更新账号余额。
