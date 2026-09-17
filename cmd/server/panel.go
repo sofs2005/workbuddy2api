@@ -13,6 +13,7 @@ import (
 	"net"
 	"net/http"
 	"path/filepath"
+	"strings"
 
 	panelhost "workbuddy2api-gui/host"
 )
@@ -45,15 +46,38 @@ func panelDataDir(cfg *Config) string {
 	return "."
 }
 
+// trimSlash 让带尾斜杠的请求等价于不带尾斜杠的那条路由。
+//
+// 为什么需要：面板的 SPA 回落把未知路径一律返回 200 + index.html，所以尾斜杠形态
+// 若不显式接管，`/healthz/` 会在网关完全挂掉时仍回 200 —— 任何把路径规范化出尾斜杠
+// 的探针 / 监控 / 反向代理都会得到**假成功**。这与 handler.go 里 ServiceName 存在的
+// 理由（识别"假成功"）直接冲突。
+//
+// 这里剥掉尾斜杠后转给网关 handler，使 `/healthz/` 与 `/healthz` 行为一致
+// （而不是 404 —— 那会让带尾斜杠的探针一直失败）。
+func trimSlash(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if len(r.URL.Path) > 1 && strings.HasSuffix(r.URL.Path, "/") {
+			r2 := r.Clone(r.Context())
+			r2.URL.Path = strings.TrimSuffix(r.URL.Path, "/")
+			next.ServeHTTP(w, r2)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
 // newRootHandler 把网关 handler 与面板 handler 合到同一个 mux，单端口对外。
 //
-// 路由分配（Go 1.22 ServeMux 按「最具体优先」匹配，故网关的三条精确模式必然
-// 胜过面板的 "/" 兜底，上游 handler.go 一行都不用改）：
+// 路由分配（Go 1.22 ServeMux 按「最具体优先」匹配，故网关的精确模式必然胜过
+// 面板的 "/" 兜底，上游 handler.go 一行都不用改）：
 //
 //	/v1/       → 网关（OpenAI 兼容）
 //	/status    → 网关（账号池状态）
 //	/healthz   → 网关（探活）
 //	/          → 面板（/api/* REST + /assets/* 静态 + SPA 回落）
+//
+// 尾斜杠形态（/status/、/healthz/）经 trimSlash 交给网关，理由见该函数注释。
 func newRootHandler(cfg *Config, cfgPath string, gwHandler http.Handler) (http.Handler, error) {
 	base, err := loopbackURL(cfg.Listen)
 	if err != nil {
@@ -75,7 +99,9 @@ func newRootHandler(cfg *Config, cfgPath string, gwHandler http.Handler) (http.H
 	root := http.NewServeMux()
 	root.Handle("/v1/", gwHandler)
 	root.Handle("/status", gwHandler)
+	root.Handle("/status/", trimSlash(gwHandler))
 	root.Handle("/healthz", gwHandler)
+	root.Handle("/healthz/", trimSlash(gwHandler))
 	root.Handle("/", panelHandler)
 
 	if listenExternal(cfg.Listen) {

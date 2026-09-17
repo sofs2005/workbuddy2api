@@ -11,16 +11,20 @@ services:
       # ── 内置面板（workbuddy2api-gui）────────────────────────────────
       # 面板与网关同进程、同端口，浏览器访问 http://<地址>:7863 即可打开。
       #
-      # ⚠️ 面板持有全部账号凭据，且与 API 同端口暴露 —— 开放前务必设置强口令，
-      #    并把服务置于 HTTPS 反向代理之后。
+      # ⚠️ 面板持有全部账号凭据（accessToken / refreshToken），且与 API 同端口暴露。
+      #    不设置口令时面板以默认的 admin/workbuddy 启动 —— 等于把账号控制权公开。
+      #    这里用 `${WBGUI_PASSWORD:?...}` 强制要求：未设置则 compose 直接报错退出，
+      #    而不是带着弱口令静默起来。
       #
-      # 取消注释并改成你的口令（默认是 admin/workbuddy，极不安全）：
-      # - WBGUI_PASSWORD=改成你的强口令
+      # 用法：在 .env 文件里写一行（或 export 后再 up）：
+      #   WBGUI_PASSWORD=你的强口令
+      #
       # 其他可选变量：
       # - WBGUI_USERNAME=admin              # 登录用户名
       # - WBGUI_SESSION_TTL=12h             # 会话有效期
       # - WBGUI_READ_ONLY=false             # true = 面板全局只读（仅监控场景）
       # - WBGUI_DANGEROUS_OPS=false         # true = 解锁删除账号等高危操作
+      - WBGUI_PASSWORD=${WBGUI_PASSWORD:?请在 .env 中设置 WBGUI_PASSWORD（面板登录口令）}
     ports:
       - "7863:7863"
     volumes:

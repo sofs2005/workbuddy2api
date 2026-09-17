@@ -25,6 +25,20 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      # 面板是独立 module（panel/go.mod），根 module 的 ./... 会在 module 边界停下，
+      # 因此必须显式带上 workbuddy2api-gui/... —— 否则面板的 9 个测试文件永远不会跑，
+      # 且其未被 import 的包也不参与类型检查。
+      - name: Build & test (gateway + panel)
+        run: |
+          go build ./... workbuddy2api-gui/...
+          go vet ./... workbuddy2api-gui/...
+          go test ./... workbuddy2api-gui/...
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 

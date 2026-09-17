@@ -39,7 +39,17 @@ docs/
 !README.md
 # 面板（panel/，git subtree）是独立项目，其文档需随 subtree 一起进出，
 # 否则每次 pull 都会静默丢掉作者的 README / 文档更新。
+# 注意 docs/ 是「目录」级排除，仅靠 !panel/**/*.md 无法救回其中的文件——
+# git 不允许重新包含被排除目录内的文件，必须先重新包含目录本身。
 !panel/README.md
 !panel/**/*.md
+!panel/docs/
+!panel/docs/**
 # panel/host 是合并时新增的装配包（非上游面板文件），其文档同样需要入库
 !panel/host/*.md
+
+# go.work：多 module 工作区文件。本项目用 go.mod 的 replace 而非 work 文件
+# （replace 随仓库分发、构建确定；work 文件会覆盖 replace 且通常在 .gitignore 外，
+# 一旦误提交会让所有人的构建行为与 CI 不一致）。此处显式忽略以防误提交。
+go.work
+go.work.sum

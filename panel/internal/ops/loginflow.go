@@ -45,7 +45,9 @@ func (s *Service) PollLogin(ctx context.Context, id string) (*LoginSession, erro
 	file := baseName(acct.FilePath)
 	restartNote := ""
 
-	// 按配置重启容器以加载新账号。
+	// 账号加载：网关内置目录监听（每 5s 比对 auths/）会自动纳入新凭证，无需重启。
+	// 下面的重启分支仅在「宿主未启用该监听」时才有意义（例如面板被单独部署、
+	// 或网关是旧版本）——此时回退到重启容器。
 	if s.cfg.RefreshConfigOnLogin && s.cfg.DangerousOps && s.cfg.DockerContainer != "" {
 		if msg, rerr := s.RestartContainer(ctx); rerr != nil {
 			restartNote = "凭证已保存，但重启容器失败，请手动重启：" + rerr.Error()
@@ -53,14 +55,7 @@ func (s *Service) PollLogin(ctx context.Context, id string) (*LoginSession, erro
 			restartNote = msg + "，新账号已加载"
 		}
 	} else {
-		switch {
-		case s.cfg.DockerContainer == "":
-			restartNote = "凭证已保存；未配置容器名，请手动重启网关使其加载"
-		case !s.cfg.DangerousOps:
-			restartNote = "凭证已保存；自动重启需要开启 dangerous_ops，请手动重启网关使其加载"
-		default:
-			restartNote = "凭证已保存；自动重启已关闭，请手动重启网关使其加载"
-		}
+		restartNote = "凭证已保存，网关将在数秒内自动加载（无需重启）"
 	}
 	s.logins.markSaved(id, file, restartNote)
 	return s.logins.Get(id)

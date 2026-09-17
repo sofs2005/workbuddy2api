@@ -72,9 +72,15 @@ func New(opts Options) (http.Handler, error) {
 	pcfg.AuthOwnerUID = -1
 	pcfg.AuthOwnerGID = -1
 
-	// 合并后「重启网关」等于重启自己：面板会杀掉自己的宿主进程，且中途请求全断。
-	// 账号加载改由宿主的账号目录监听完成（落盘后数秒自动进池，零停机），故关闭该能力。
-	pcfg.DockerContainer = ""
+	// 合并后「重启网关」等于重启自己（面板随宿主进程一起重启，中断数秒）。
+	// 这对**账号**加载已无必要——账号改由宿主的目录监听热加载（落盘后数秒入池）。
+	//
+	// 但**配置**变更仍然必须重启：网关只在启动时读 config.json，没有 SIGHUP /
+	// 文件监听之类的热重载路径（已确认）。若把 DockerContainer 置空，面板的
+	// 「系统」页重启按钮会被禁用，配置页就变成「能存不能生效」的死路。
+	// 因此保留该能力（默认 workbuddy2api），由面板自身的 DockerAvailable() 判定：
+	// 未挂载 docker.sock 时自动降级为「Docker 不可用」，界面如实提示，
+	// 用户改在宿主机执行 docker compose restart 即可。
 	pcfg.RefreshConfigOnLogin = false
 
 	dataDir := opts.DataDir

@@ -153,7 +153,7 @@ func (s *Server) handleAccountDelete(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "message": "凭证文件已删除，重启网关后该账号移出账号池"})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "message": "凭证文件已删除，网关将在数秒内将该账号移出账号池（无需重启）"})
 }
 
 func (s *Server) handleAccountImport(w http.ResponseWriter, r *http.Request) {
@@ -672,7 +672,7 @@ func (s *Server) handleConfigPut(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err)
 		return
 	}
-	msg := "配置已保存。重启网关容器后生效（系统页可一键重启）"
+	msg := "配置已保存。网关只在启动时读取 config.json，需重启进程才会生效"
 	if fallback {
 		msg += "。注意：当前 config.json 以 Docker 单文件方式挂载，无法原子替换，本次为原地写入"
 	}

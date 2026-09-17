@@ -22,5 +22,9 @@ README.md
 panel/web/node_modules/
 panel/web/dist/
 panel/data/
-panel/internal/webui/dist/assets/
 panel/.git
+
+# Windows 下本地构建留下的二进制（go build ./cmd/server 会在仓库根产出 server.exe）。
+# 不进上下文：与正确性无关，但会白白让每次构建多传十几 MB。
+/server.exe
+/wb2api.exe
