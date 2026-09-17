@@ -179,9 +179,16 @@ flowchart LR
 git clone https://github.com/sofs2005/workbuddy2api.git
 cd workbuddy2api
 cp config.example.json config.json
+
+# 面板登录口令（必填 —— 未设置时 compose 会直接报错退出）
+echo 'WBGUI_PASSWORD=你的强口令' > .env
 ```
 
 编辑 `config.json`，**至少设置 `api_key`**（`留空 = 不鉴权`，公网部署务必设置）。示例中的 `test_key` 等均为占位符，`config.example.json` 不含任何真实密钥。
+
+> `.env` 里的 `WBGUI_PASSWORD` 是**内置面板**的登录口令，与 `api_key` 是两回事：
+> `api_key` 保护 `/v1` 接口（给下游客户端用），`WBGUI_PASSWORD` 保护管理面板（给你自己用）。
+> 面板能读到账号凭据，故口令必须够强；`.env` 已在 `.gitignore` 中，不会误提交。
 
 ### 登录添加账号
 
