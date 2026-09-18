@@ -36,32 +36,23 @@ WorkBuddy2API 是一个自托管的 **OpenAI 兼容上游网关**，将 ```CodeB
 
 ### 内置 Web 管理面板
 
-本项目已**内置** [workbuddy2api-gui](https://github.com/287775856/workbuddy2api-gui) 面板（经 `git subtree` 引入到 `panel/`），**与网关同进程、同端口**，无需单独部署第二个容器：
+本项目**内置**了第三方面板 [workbuddy2api-gui](https://github.com/287775856/workbuddy2api-gui)
+（经 `git subtree` 引入到 `panel/`，出处与许可见[面板出处与维护](#面板出处与维护)），
+并把它从「独立进程 + 独立端口」改为**与网关同进程、同端口**，因此只需一个容器：
 
 | 路径 | 归属 |
 |---|---|
 | `/v1/*`、`/status`、`/healthz` | 网关（OpenAI 兼容接口与探活） |
 | `/api/*`、`/assets/*`、`/` | 面板（Web 控制台） |
 
-浏览器访问 `http://<地址>:7863` 即可打开控制台，功能包括：账号池仪表盘、扫码添加账号（国内版 / 国际版）、批量签到、实时积分查询、猫猫旅行、凭证导入、聊天测试台、网关配置在线编辑、Token 有效期预警。
+浏览器访问 `http://<地址>:7863` 即可打开控制台——账号池状态、网页 OAuth 添加账号、
+批量签到 / 查积分、凭证导入、聊天测试台、`config.json` 在线编辑等，详见
+[使用内置面板](#使用内置面板)。
 
-**账号热加载**：面板扫码落盘的新凭证会在数秒内自动进池，**无需重启容器**（网关后台每 5 秒比对 `auths/` 目录，变化即重扫；已有账号的积分 / 冷却 / 计数状态不受影响）。
+> ⚠️ 面板持有全部账号凭据（`accessToken` / `refreshToken`），且与 API 同端口暴露。
+> 部署后**第一件事就是改掉默认口令**，并置于 **HTTPS 反向代理**之后。
 
-**配置分离**：网关配置仍是 `config.json`；面板配置**只认 `WBGUI_*` 环境变量**（面板自己的 `listen` 字段在合并模式下无效，端口由网关的 `config.listen` 决定）。常用变量：
-
-| 变量 | 说明 |
-|---|---|
-| `WBGUI_PASSWORD` | 面板登录口令（**默认 `workbuddy`，务必修改**） |
-| `WBGUI_USERNAME` | 面板登录用户名（默认 `admin`） |
-| `WBGUI_READ_ONLY` | `true` = 面板全局只读，关闭一切写操作 |
-| `WBGUI_DANGEROUS_OPS` | `true` = 解锁删除账号等高危操作（默认 false） |
-| `WBGUI_SESSION_TTL` | 会话有效期（默认 `12h`） |
-
-> ⚠️ **安全**：面板持有全部账号凭据（`accessToken` / `refreshToken`），且与 API 同端口暴露。
-> 部署后**第一件事就是改掉默认口令**，并置于 **HTTPS 反向代理**之后。危险操作开关默认关闭。
-
-> 面板的「请求统计」页依赖网关 `/v1/stats` 端点，本上游未提供该端点，故该页默认隐藏
-> （见 `panel/web/src/App.tsx` 的 `STATS_ENABLED`）；其余页面不受影响。
+首次登录、页面清单、`WBGUI_*` 变量、账号热加载等完整说明见[使用内置面板](#使用内置面板)。
 
 ### 其他社区面板
 
@@ -247,7 +238,27 @@ curl -s -H "Authorization: Bearer $API_KEY" http://localhost:7863/status
 > 旧版本需要 `docker compose restart` 才能加载新账号；热加载上线后已不再需要。
 > 若你确实想重启（例如改了 `config.json`），执行 `docker compose restart`。
 
-**启动服务**
+#### 非 root 宿主用户注意（属主问题）
+
+`./login.sh` 以**当前宿主用户**落盘凭证（权限 0600），而容器内网关以 `app(uid 10001)` 读 + 回写
+（refresh / realm 补标识走 tmp+rename，需要目录写权限）。二者 uid 不同（例如 Linux 非 root 账号
+通常是 uid 1000）时容器读不到凭证文件，`/status` 账号数为 0——与 `./data` 卷的属主问题同源。
+登录后、启动前把目录属主交给 10001（root 或部署用户执行）：
+
+```bash
+chown -R 10001:10001 ./auths
+```
+
+之后新增账号**推荐直接用内置面板**（浏览器打开 `:7863` → 添加账号）：面板与网关同进程，
+落盘的凭证属主天然是 `10001`，无需反复 chown，且 5 秒内自动入池、无需重启。
+
+也可进容器登录（`app` 自身落盘，属主即 10001，无需反复 chown）：
+
+```bash
+docker compose exec -it wb2api bash -c './login.sh'
+```
+
+### 启动服务
 
 ```bash
 docker compose up -d
@@ -259,7 +270,7 @@ docker compose up -d
 docker compose up -d --build
 ```
 
-**验证**
+### 验证
 
 ```bash
 # 健康检查（无可用账号时 503）；service 字段用于确认打到的是本网关
@@ -268,6 +279,24 @@ curl -s http://localhost:7863/healthz
 
 # 面板已挂载（免登录可调，不含敏感信息）
 curl -s http://localhost:7863/api/session
+
+# 模型列表
+curl -s http://localhost:7863/v1/models -H "Authorization: Bearer your-api-key"
+
+# 账号状态（汇总 + 每账号详情，disabled 账号透出 disabled_reason）
+curl -s http://localhost:7863/status -H "Authorization: Bearer your-api-key"
+
+# 流式聊天
+curl -sN http://localhost:7863/v1/chat/completions \
+  -H "Authorization: Bearer your-api-key" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"deepseek-v4-flash","messages":[{"role":"user","content":"hi"}],"stream":true}'
+
+# 非流式聊天（本地聚合）
+curl -s http://localhost:7863/v1/chat/completions \
+  -H "Authorization: Bearer your-api-key" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"deepseek-v4-flash","messages":[{"role":"user","content":"hi"}],"stream":false}'
 ```
 
 ### 使用内置面板
@@ -285,7 +314,7 @@ curl -s http://localhost:7863/api/session
 | 页面 | 能力 |
 |---|---|
 | 📊 仪表盘 | 账号池可用 / 冷却 / 禁用计数、积分总览、在途与粘性会话、Token 过期预警 |
-| 👥 账号管理 | 全量账号表格、状态筛选、批量签到 / 刷新 / 查积分、单账号详情、手工导入凭证 |
+| 👥 账号管理 | 全量账号表格、状态筛选、批量签到 / 刷新 / 查积分、单账号详情（含猫档案 / 旅行状态）、手工导入凭证 |
 | ➕ 添加账号 | 网页 OAuth 授权（国内版 / 国际版），自动落盘并热加载，无需重启 |
 | 💬 聊天测试 | 动态模型下拉、流式 / 非流式、推理内容展示、token 用量与首字延迟 |
 | ⚙️ 网关配置 | `config.json` 分组表单或 JSON 源码双模式编辑，保存前自动备份 |
@@ -334,21 +363,6 @@ docker compose pull && docker compose up -d
 
 镜像由 GitHub Actions 在 `master` 推送时自动构建发布到 GHCR；也可 `docker compose up -d --build` 从源码本地构建。
 
-> **非 root 宿主用户注意**：`./login.sh` 以**当前宿主用户**落盘凭证（权限 0600），而容器内网关以 `app(uid 10001)` 读 + 回写（refresh / realm 补标识走 tmp+rename，需要目录写权限）。二者 uid 不同（例如 Linux 非 root 账号通常是 uid 1000）时容器读不到凭证文件，`/status` 账号数为 0——与 `./data` 卷的属主问题同源。登录后、启动前把目录属主交给 10001（root 或部署用户执行）：
->
-> ```bash
-> chown -R 10001:10001 ./auths
-> ```
->
-> 之后新增账号**推荐直接用内置面板**（浏览器打开 `:7863` → 添加账号）：面板与网关同进程，
-> 落盘的凭证属主天然是 `10001`，无需反复 chown，且 5 秒内自动入池、无需重启。
->
-> 也可进容器登录（`app` 自身落盘，属主即 10001，无需反复 chown）：
->
-> ```bash
-> docker compose exec -it wb2api bash -c './login.sh'
-> ```
-
 ### 源码构建
 
 面板（`panel/`）是 `git subtree` 引入的**独立 Go module**，根 module 通过
@@ -382,44 +396,63 @@ CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o credit ./cmd/credit
 > 用 `docker compose up -d --build` 构建时无需手工构建前端 —— Dockerfile 的
 > 第一个阶段（`node:20-alpine`）会自动完成。
 
-### 同步面板上游（维护者）
+### 面板出处与维护
 
-`panel/` 由 [`287775856/workbuddy2api-gui`](https://github.com/287775856/workbuddy2api-gui) 经
-git subtree 引入。拉取面板作者的新提交：
+#### 出处与许可
+
+内置面板**不是本项目自研**，而是引入的第三方开源项目：
+
+| 项 | 说明 |
+|---|---|
+| 原始仓库 | [`287775856/workbuddy2api-gui`](https://github.com/287775856/workbuddy2api-gui) |
+| 引入方式 | `git subtree`，落在本仓库 `panel/` 目录（保留作者提交历史） |
+| 引入版本 | 面板提交 `209d111`（2026-09-17 squash 引入） |
+| 开源协议 | MIT（`panel/LICENSE`），与本项目一致 |
+| 面板文档 | [`panel/README.md`](panel/README.md)（作者原文，未改动） |
+
+面板的作者与版权归原作者所有。本项目对其做了「改造成同进程同端口」的适配性修改，
+**未改变其功能语义**；原项目的单独部署方式（独立容器 + 独立端口）在其原仓库中依然可用。
+
+> 面板的 `LICENSE` 版权署名沿用上游（`Copyright (c) 2026 Sliverkiss`）——面板作者在
+> `panel/README.md` 中说明「与上游 workbuddy2api 保持一致」。本项目在此显式标注其真实出处
+> 为 `287775856/workbuddy2api-gui`，以便追溯。
+
+#### 相对原版做了什么
+
+为把「独立进程 + 独立端口」变成「同进程同端口」，对面板源码有 5 处修改 + 若干新增文件。
+**完整清单与逐条理由见 [`panel/HOST-PATCHES.md`](panel/HOST-PATCHES.md)**，要点：
+
+| 改动 | 原因 |
+|---|---|
+| `internal/authstore/preserve.go`（新增） | 修数据丢失：面板存凭证会抹掉 `auth.realm` 与 `device_token`（后者不可恢复） |
+| `internal/ops/loginflow.go`、`internal/api/server.go` | 文案从「请手动重启网关」改为「数秒内自动加载」 |
+| `web/src/App.tsx` | 隐藏「请求统计」页（依赖本上游没有的 `/v1/stats`） |
+| `internal/webui/dist/index.html` | 保留占位页（`go:embed` 需要目录非空，构建时会被覆盖） |
+
+网关侧的新增文件（不属于 subtree，不受面板 pull 影响）：
+
+- `panel/host/host.go` —— 面板装配包。**刻意不含 `internal` 段**，因为 Go 的 internal
+  规则不允许根 module 直接 import `workbuddy2api-gui/internal/*`，宿主要能导入它。
+- `cmd/server/panel.go` —— 路由合并（`/v1/*`、`/status`、`/healthz` → 网关；其余 → 面板）。
+- `cmd/server/reload.go` —— 账号目录热加载（每 5s 比对 `auths/` 指纹）。
+
+对上游已有文件的改动仅 `cmd/server/main.go` 少量几行、`Dockerfile` 的前端构建阶段、
+`.dockerignore` / `.gitignore` 若干忽略项。
+
+#### 同步面板上游的新提交
 
 ```bash
 git subtree pull --prefix=panel https://github.com/287775856/workbuddy2api-gui.git master --squash
 ```
 
-合并适配集中在两处，且都是**新增文件**（上游没有，故 pull 不会冲突）：
-
-- `panel/host/host.go` —— 面板装配包（不含 `internal` 段，宿主导入用）
-- `cmd/server/panel.go` / `cmd/server/reload.go` —— 路由合并与账号热加载
-
-对上游已有文件的改动仅 `cmd/server/main.go` 少量几行、`Dockerfile` 的前端构建阶段、
-`.dockerignore` / `.gitignore` 若干忽略项。
-
-### 验证
+拉取后**务必**按 `HOST-PATCHES.md` 逐条复查上述改动是否仍在，并跑测试确认：
 
 ```bash
-# 模型列表
-curl -s http://localhost:7863/v1/models -H "Authorization: Bearer your-api-key"
-
-# 账号状态（汇总 + 每账号详情，disabled 账号透出 disabled_reason）
-curl -s http://localhost:7863/status -H "Authorization: Bearer your-api-key"
-
-# 流式聊天
-curl -sN http://localhost:7863/v1/chat/completions \
-  -H "Authorization: Bearer your-api-key" \
-  -H "Content-Type: application/json" \
-  -d '{"model":"deepseek-v4-flash","messages":[{"role":"user","content":"hi"}],"stream":true}'
-
-# 非流式聊天（本地聚合）
-curl -s http://localhost:7863/v1/chat/completions \
-  -H "Authorization: Bearer your-api-key" \
-  -H "Content-Type: application/json" \
-  -d '{"model":"deepseek-v4-flash","messages":[{"role":"user","content":"hi"}],"stream":false}'
+go build ./... workbuddy2api-gui/... && go test ./... workbuddy2api-gui/...
 ```
+
+> 面板作者更新频率不高（最后提交 2026-09-14）。同步的价值主要是跟进其功能改进；
+> 若上游长期停更，本项目可自行维护 `panel/` 而不必再 pull。
 
 ## 安全与合规
 
@@ -482,3 +515,15 @@ curl -s http://localhost:7863/v1/chat/completions \
 - 再分发（源码或二进制形式）时，须保留原仓库的 MIT 版权声明与许可声明，并在 NOTICE 或 README 中注明原始出处 `https://github.com/Sliverkiss/workbuddy2api`
 - 本项目不授予任何上游（CodeBuddy）接口或服务的权利；使用者仍需自行遵守上游服务条款
 - 本项目的使用同时受上方**免责声明**约束；如免责声明与 MIT License 存在不一致，以免责声明为准
+
+### 第三方组件
+
+`panel/` 目录是**独立引入的第三方项目**，版权归原作者，采用 MIT 协议（`panel/LICENSE`）：
+
+| 组件 | 出处 | 协议 |
+|---|---|---|
+| Web 管理面板 | [`287775856/workbuddy2api-gui`](https://github.com/287775856/workbuddy2api-gui)（`git subtree` 引入） | MIT |
+| 面板前端依赖 | React / TypeScript / Vite 等，见 `panel/web/package.json` | 各自协议 |
+
+再分发本仓库（含二进制镜像）时，请一并保留 `panel/LICENSE` 与 `panel/README.md` 中的原作者版权声明。
+本项目对面板的修改清单见 [`panel/HOST-PATCHES.md`](panel/HOST-PATCHES.md)。
