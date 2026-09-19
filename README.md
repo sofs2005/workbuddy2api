@@ -444,7 +444,7 @@ CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o credit ./cmd/credit
 |---|---|
 | 原始仓库 | [`287775856/workbuddy2api-gui`](https://github.com/287775856/workbuddy2api-gui) |
 | 引入方式 | `git subtree`，落在本仓库 `panel/` 目录（保留作者提交历史） |
-| 引入版本 | 面板提交 `209d111`（2026-09-17 squash 引入） |
+| 引入版本 | 面板提交 `9413e70`（2026-09-19 同步；初始引入为 `209d111`） |
 | 开源协议 | MIT（`panel/LICENSE`），与本项目一致 |
 | 面板文档 | [`panel/README.md`](panel/README.md)（作者原文，未改动） |
 
@@ -457,15 +457,20 @@ CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o credit ./cmd/credit
 
 #### 相对原版做了什么
 
-为把「独立进程 + 独立端口」变成「同进程同端口」，对面板源码有 5 处修改 + 若干新增文件。
+为把「独立进程 + 独立端口」变成「同进程同端口」，对面板源码有 4 处修改 + 若干新增文件
+（原为 5 处，其中「隐藏请求统计页」已于 2026-09-19 撤销——上游补齐了 `/v1/stats`
+路由，该页已可正常使用）。
 **完整清单与逐条理由见 [`panel/HOST-PATCHES.md`](panel/HOST-PATCHES.md)**，要点：
 
 | 改动 | 原因 |
 |---|---|
 | `internal/authstore/preserve.go`（新增） | 修数据丢失：面板存凭证会抹掉 `auth.realm` 与 `device_token`（后者不可恢复） |
 | `internal/ops/loginflow.go`、`internal/api/server.go` | 文案从「请手动重启网关」改为「数秒内自动加载」 |
-| `web/src/App.tsx` | 隐藏「请求统计」页（依赖本上游没有的 `/v1/stats`） |
 | `internal/webui/dist/index.html` | 保留占位页（`go:embed` 需要目录非空，构建时会被覆盖） |
+
+> 「请求统计」页的**累计统计**可用；其「时间趋势」卡片依赖 `/v1/stats` 的时间维度参数
+> （`range`/`interval` 等），上游网关尚未实现，当前会停在「正在加载趋势数据」。
+> 网关侧补齐后自动生效，无需再改面板。
 
 网关侧的新增文件（不属于 subtree，不受面板 pull 影响）：
 
@@ -489,8 +494,16 @@ git subtree pull --prefix=panel https://github.com/287775856/workbuddy2api-gui.g
 go build ./... workbuddy2api-gui/... && go test ./... workbuddy2api-gui/...
 ```
 
-> 面板作者更新频率不高（最后提交 2026-09-14）。同步的价值主要是跟进其功能改进；
-> 若上游长期停更，本项目可自行维护 `panel/` 而不必再 pull。
+两个易踩的点：
+
+1. `--squash` 会把 `panel/` 与上游做三方合并，**本地新增的文件会被当成"上游没有"而删除**
+   （`host/host.go`、`preserve.go`、`HOST-PATCHES.md` 等），需 `git checkout HEAD --` 恢复，
+   修改类改动（文案、`mergeMissingKeys` 调用）需按 `HOST-PATCHES.md` 手动重放。
+2. 上游若更新了 `internal/webui/dist/index.html` 的资源 hash，需在 `panel/web/` 跑
+   `npm run build` 重新生成产物，否则源码模式下页面白屏。
+
+> 面板作者最后提交 2026-09-18（`9413e70`，「请求统计」时间趋势）。同步的价值主要是
+> 跟进其功能改进；若上游长期停更，本项目可自行维护 `panel/` 而不必再 pull。
 
 ## 安全与合规
 

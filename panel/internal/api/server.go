@@ -365,7 +365,15 @@ func (s *Server) handleLoginCancel(w http.ResponseWriter, r *http.Request) {
 
 // handleStats 返回网关的按模型统计 + 官方价换算。
 func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
-	st, err := s.svc.Gateway().Stats(r.Context())
+	// 时间维度参数透传给网关（range/from/to/interval/model）。
+	q := r.URL.Query()
+	st, err := s.svc.Gateway().StatsRange(r.Context(), gateway.StatsOptions{
+		Range:    q.Get("range"),
+		From:     q.Get("from"),
+		To:       q.Get("to"),
+		Interval: q.Get("interval"),
+		Model:    q.Get("model"),
+	})
 	if err != nil {
 		writeError(w, err)
 		return

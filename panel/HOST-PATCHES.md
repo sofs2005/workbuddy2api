@@ -3,6 +3,9 @@
 本目录（`panel/`）由 `git subtree` 引入自
 [`287775856/workbuddy2api-gui`](https://github.com/287775856/workbuddy2api-gui)。
 
+上次同步：面板上游 `9413e70`（2026-09-18，实为 2026-09-19 拉取）。
+当前须保留的改动为第 1–3 条与第 5 条；第 4 条已撤销（原前提失效，见该节）。
+
 为了让它与网关**同进程、同端口**运行，合并时改动了下面几处面板源码。
 这些文件上游也会改，因此**每次 `git subtree pull` 后都需要重新确认**。
 （纯新增的文件不在此列——它们不冲突，见文末。）
@@ -47,11 +50,21 @@ go build ./... workbuddy2api-gui/... && go test ./... workbuddy2api-gui/...
   配置确实**不能**热重载（网关只在启动时读 `config.json`，无 SIGHUP / 文件监听），
   故保留「需重启」的准确说法。
 
-### 4. `web/src/App.tsx`（隐藏「请求统计」页）
+### 4. `web/src/App.tsx`（**已撤销**：统计页现已启用）
 
-新增 `STATS_ENABLED = false` 常量，据此过滤导航项与路由。该页依赖网关的
-`/v1/stats` 端点，本上游只注册了 `/v1/chat/completions`、`/v1/models`、
-`/status`、`/healthz` 四条路由。上游若日后补齐该端点，改为 `true` 即可。
+原先新增 `STATS_ENABLED = false` 常量过滤导航项与路由，理由是「该页依赖网关的
+`/v1/stats` 端点，而本上游只注册了 4 条路由」。
+
+**该前提已失效**：上游 PR #161 在面板引入后 34 分钟就补上了 `/v1/stats`
+（`internal/server/handler.go`，提交 `733d348`）。2026-09-19 同步面板上游
+`9413e70` 时一并撤销此开关，`App.tsx` 已与上游逐字一致。
+
+> 注意区分两种能力：`/v1/stats` 的**累计快照**（按模型聚合）上游已实现，统计页
+> 的这部分可用；而面板 `9413e70` 新增的「时间趋势」卡片依赖 `/v1/stats` 的
+> **时间维度参数**（`range`/`from`/`to`/`interval`/`model` 与响应的 `range`、
+> `series_buckets` 字段），上游网关（`b08f518`）**尚未实现**。故趋势图当前会停在
+> 「正在加载趋势数据」（面板作者预留的降级分支），其余功能不受影响。网关侧补齐
+> 后该卡片自动开始工作，无需再改面板。
 
 ### 5. `internal/webui/dist/index.html`（前端产物）
 
@@ -61,6 +74,10 @@ go build ./... workbuddy2api-gui/... && go test ./... workbuddy2api-gui/...
 
 合并后的 `Dockerfile` 第一个阶段（`node:20-alpine`）会重新构建并覆盖它，
 故这份文件的内容不重要；**但不要删除它**——`//go:embed all:dist` 需要目录非空。
+
+`9413e70` 同步时上游更新了此文件引用的 hash（`index-BQ3iX5L-` → `index-BEIjNl4j`）。
+已在 `panel/web/` 跑 `npm run build` 重新生成，产物 hash 与引用一致；源码模式下
+（不经 Dockerfile）也能正常渲染。
 
 ## 纯新增、不会冲突的文件
 

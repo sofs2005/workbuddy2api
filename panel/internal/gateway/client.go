@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 )
@@ -409,11 +410,73 @@ type Stats struct {
 	UptimeSec int64       `json:"uptime_sec"`
 	Total     ModelStat   `json:"total"`
 	Models    []ModelStat `json:"models"`
+	// SeriesBuckets 时间序列的桶数（判断数据可回溯范围）。
+	SeriesBuckets int `json:"series_buckets"`
+	// Range 时间维度查询结果（仅当请求带了 range/from/to/interval/model 时返回）。
+	Range *RangeResult `json:"range,omitempty"`
+}
+
+// RangePoint 时间序列上的一个数据点。
+type RangePoint struct {
+	Key     string    `json:"key"`
+	Start   time.Time `json:"start"`
+	End     time.Time `json:"end"`
+	Stats   ModelStat `json:"stats"`
+	Derived ModelStat `json:"derived"` // 派生指标复用同一结构（字段一致）
+}
+
+// RangeResult 时间范围聚合结果。
+type RangeResult struct {
+	Interval string       `json:"interval"`
+	From     time.Time    `json:"from"`
+	To       time.Time    `json:"to"`
+	Points   []RangePoint `json:"points"`
+	Total    ModelStat    `json:"total"`
+	Models   []string     `json:"models"`
+}
+
+// StatsOptions 时间维度查询参数。
+type StatsOptions struct {
+	// Range 相对区间：today / yesterday / 7d / 30d / 90d / all
+	Range string
+	// From/To 绝对区间（RFC3339）；设置后优先于 Range。
+	From string
+	To   string
+	// Interval 聚合粒度：hour / day / week
+	Interval string
+	// Model 只看单个模型（空 = 全部）
+	Model string
 }
 
 // Stats 拉取按模型聚合的请求统计。
 func (c *Client) Stats(ctx context.Context) (*Stats, error) {
-	resp, err := c.do(ctx, http.MethodGet, "/v1/stats", nil)
+	return c.StatsRange(ctx, StatsOptions{})
+}
+
+// StatsRange 拉取统计（可选时间维度参数）。
+func (c *Client) StatsRange(ctx context.Context, opt StatsOptions) (*Stats, error) {
+	q := url.Values{}
+	if opt.Range != "" {
+		q.Set("range", opt.Range)
+	}
+	if opt.From != "" {
+		q.Set("from", opt.From)
+	}
+	if opt.To != "" {
+		q.Set("to", opt.To)
+	}
+	if opt.Interval != "" {
+		q.Set("interval", opt.Interval)
+	}
+	if opt.Model != "" {
+		q.Set("model", opt.Model)
+	}
+	path := "/v1/stats"
+	if enc := q.Encode(); enc != "" {
+		path += "?" + enc
+	}
+
+	resp, err := c.do(ctx, http.MethodGet, path, nil)
 	if err != nil {
 		return nil, err
 	}

@@ -13,18 +13,10 @@ import Playground from './pages/Playground'
 import ConfigPage from './pages/ConfigPage'
 import System from './pages/System'
 
-// STATS_ENABLED 「请求统计」页开关。
-//
-// 该页依赖网关的 /v1/stats 端点，而本项目合并的官方上游
-// （Sliverkiss/workbuddy2api）只注册了 /v1/chat/completions、/v1/models、
-// /status、/healthz 四条路由 —— /v1/stats 仅存在于面板作者的 fork 里。
-// 故默认关闭，避免用户点进去看到报错。上游若日后补齐该端点，改为 true 即可。
-const STATS_ENABLED = false
-
 const NAV = [
   { to: '/', label: '仪表盘', icon: '📊', end: true },
   { to: '/accounts', label: '账号管理', icon: '👥' },
-  ...(STATS_ENABLED ? [{ to: '/stats', label: '请求统计', icon: '📈' }] : []),
+  { to: '/stats', label: '请求统计', icon: '📈' },
   { to: '/login', label: '添加账号', icon: '➕' },
   { to: '/playground', label: '聊天测试', icon: '💬' },
   { to: '/config', label: '网关配置', icon: '⚙️' },
@@ -150,7 +142,7 @@ function Shell({
         <Routes>
           <Route path="/" element={<Dashboard />} />
           <Route path="/accounts" element={<Accounts session={session} />} />
-          {STATS_ENABLED && <Route path="/stats" element={<StatsPage session={session} />} />}
+          <Route path="/stats" element={<StatsPage session={session} />} />
           <Route path="/login" element={<LoginWizard session={session} onDone={onSessionRefresh} />} />
           <Route path="/playground" element={<Playground />} />
           <Route path="/config" element={<ConfigPage session={session} />} />

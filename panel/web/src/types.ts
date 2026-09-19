@@ -296,6 +296,25 @@ export interface ModelStat {
   last_seen?: string
 }
 
+/** 时间序列上的一个数据点。 */
+export interface RangePoint {
+  key: string
+  start: string
+  end: string
+  stats: ModelStat
+  derived: ModelStat
+}
+
+/** 时间范围聚合结果。 */
+export interface RangeResult {
+  interval: 'hour' | 'day' | 'week'
+  from: string
+  to: string
+  points: RangePoint[] | null
+  total: ModelStat
+  models: string[] | null
+}
+
 /** 网关 /v1/stats 响应。 */
 export interface Stats {
   enabled: boolean
@@ -305,6 +324,10 @@ export interface Stats {
   uptime_sec: number
   total: ModelStat
   models: ModelStat[] | null
+  /** 时间序列桶数（判断数据可回溯范围） */
+  series_buckets?: number
+  /** 时间维度查询结果（带时间参数时返回） */
+  range?: RangeResult
 }
 
 /** 单个模型的官方单价（元/百万 token）。 */
