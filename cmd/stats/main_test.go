@@ -13,6 +13,26 @@ import (
 	"time"
 )
 
+// TestMain 把测试进程的本地时区钉死为 UTC+8。
+//
+// buildFrame 的标题用 t.Local() 渲染窗口起始时刻 —— 这是**有意的生产行为**：
+// since 由网关侧 time.Now() 产生，按查看者本地时区显示同一时刻，与 git log 等
+// CLI 惯例一致。但 wall-clock 渲染结果因此依赖运行机器的时区，而断言里写的是
+// 具体的墙上时间：
+//
+//	开发机 UTC+8：2026-09-14T20:43:52+08:00 → "自 09-14 20:43"  ✅
+//	CI ubuntu-latest UTC：同一时刻 → "自 09-14 12:43"  ❌
+//
+// 即断言随机器时区漂移（CI 与本地结论不一致）。这里显式钉死时区，让渲染确定、
+// 断言有意义 —— 而不是放宽断言去迁就环境。与 internal/server/degrade_test.go
+// 用 time.FixedZone("CST", 8*60*60) 的口径一致。
+//
+// frameNow / fago 走的是 now.Sub(t) 求时长，与时区无关，不受此设置影响。
+func TestMain(m *testing.M) {
+	time.Local = time.FixedZone("CST", 8*60*60)
+	os.Exit(m.Run())
+}
+
 // ─── resolveGateway：地址与密钥解析 ──────────────────────────────────────
 
 // TestResolveGatewayFromConfig 从 config.json 取端口与 api_key（主路径）。
