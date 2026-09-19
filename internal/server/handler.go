@@ -47,6 +47,10 @@ type Config struct {
 	// false（显式逃生门）时即便 auth realm=global 也不提供 global: 模型名
 	// （modelList 不列 global 名单）。
 	GlobalEnabled bool
+
+	// AdminEnabled 运维管理端点开关（config admin.enabled，默认 false）。
+	// 关闭时 /admin/* 一律 404（而非 403——不向外暴露"这里存在管理面"）。
+	AdminEnabled bool
 }
 
 // notFoundCooldown 上游 404 的固定短冷却时长。
@@ -103,6 +107,17 @@ func NewHandler(cfg Config) *Handler {
 	h.mux.HandleFunc("GET /status", h.withAuth(h.status))
 	h.mux.HandleFunc("GET /v1/stats", h.withAuth(h.stats))
 	h.mux.HandleFunc("POST /v1/stats/reset", h.withAuth(h.statsReset))
+	// 运维管理端点（默认关闭，config admin.enabled 开启后生效）。
+	// 路径用 {uid} 通配而非查询参数：uid 是账号身份，放进路径便于审计与直观。
+	// 条件注册而非 handler 内 404（设计 supplement §2.3）：未注册的路由对未鉴权
+	// 探测回 mux 默认纯文本 404、对 GET 探测无 405+Allow 头，与真 404 完全不可
+	// 区分——路由一旦注册，"带 key 得 401 / GET 得 405 / JSON 信封 404" 三者都会
+	// 暴露管理面存在。
+	if cfg.AdminEnabled {
+		h.mux.HandleFunc("POST /admin/accounts/{uid}/disable", h.withAuth(h.adminAccountDisable))
+		h.mux.HandleFunc("POST /admin/accounts/{uid}/enable", h.withAuth(h.adminAccountEnable))
+		h.mux.HandleFunc("POST /admin/accounts/{uid}/revive", h.withAuth(h.adminAccountRevive))
+	}
 	h.mux.HandleFunc("GET /healthz", h.healthz)
 	return h
 }
@@ -301,9 +316,9 @@ func (h *Handler) modelList() []map[string]any {
 	out := make([]map[string]any, 0)
 	for _, mi := range h.fetchDynamicModels() {
 		entry := map[string]any{
-			"id":                "cn:" + mi.ID,
-			"object":            "model",
-			"created":           1753600000,
+			"id":       "cn:" + mi.ID,
+			"object":   "model",
+			"created":  1753600000,
 			"owned_by": "workbuddy",
 		}
 		// context_length / max_output_tokens 四级查找（upstream.context_catalog +
@@ -497,28 +512,34 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// 提取与下方会话头族的聚合键共用同一结果，故**不受粘性开关影响**：粘性未启用
 	// （Session==nil）时聚合键仍应是会话级，而不是退化成轮级。
 	sessKey := session.ExtractKey(body)
+	// stickyKey 是**粘性专用**键，与 sessKey（会话头族聚合用）分开：
+	// sessKey 为空时（OpenAI 兼容客户端——dsh / Codex 等既无 conversationId 也无
+	// metadata）用首条 user 消息派生会话级 fallback 键，使粘性仍能生效。
+	// 不能直接改 sessKey：那会连带改变上游头族轮级复合键（sessKey 入键）的聚合
+	// 语义，属于另一条链路的契约。
+	stickyKey := sessKey
+	if stickyKey == "" {
+		stickyKey = session.StickyFallbackKey(body)
+	}
 	stickyUID := ""
-	if h.cfg.Session != nil && sessKey != "" {
+	if h.cfg.Session != nil && stickyKey != "" {
 		// 传给 ResolveForModel 的是**完整**模型名（peek.Model，含 realm 前缀）。
 		// 粘性命中校验走 injected AvailableForModel 闭包 → 闭包内部 resolveModel 剥前缀
 		// 得 realm+bare，再按 realm 过滤可用集合。若传已剥前缀的 bareModel，闭包对裸名
 		// 恒剥出 realm=cn，跨 realm 粘性会话会被错误钉回 CN 集合；完整前缀才能让
 		// 闭包正确过滤到 global 集合（见 cmd/server/wiring.go realmAwareAvailableForModel）。
 		// 模型名也参与成本账本与选号过滤，不能用 "-" 占位污染模型键。
-		if uid, ok := h.cfg.Session.ResolveForModel(sessKey, peek.Model); ok {
+		if uid, ok := h.cfg.Session.ResolveForModel(stickyKey, peek.Model); ok {
 			stickyUID = uid
 		}
 	}
 
-	// 轮级兜底聚合键：无会话键的客户端（OpenAI 兼容协议——dsh / Codex / Cherry
-	// Studio 等请求体里既无 conversationId 也无 metadata）sessKey 恒空，会话头族的
-	// 聚合主键此前只能逐请求新生成，agent 多轮在上游用量明细里仍是一条请求一条记录。
-	// 这里按 body 里最后一条 user 消息派生轮级键（同轮内所有上游调用同键）。
+	// 轮级聚合键：按 body 里最后一条 user 消息派生（同轮内所有上游调用同键，
+	// 换 user 消息换键）。#170 起带会话键的客户端也统一走轮级（与官方桌面 CLI 的
+	// X-Conversation-Request-ID 轮级语义对齐），故不再限 sessKey=="" 才计算；
+	// sessKey 由调用侧以复合键方式入键（防不同会话同轮文本互撞）。
 	// 必须在下方 prompt.Rewrite / rewriteModel 之前取——改写会动 messages 内容。
-	turnKey := ""
-	if sessKey == "" {
-		turnKey = session.TurnKey(body)
-	}
+	turnKey := session.TurnKey(body)
 
 	// gateway_hint 判定所需的请求形态（image_url part）：在改写前取（与 turnKey
 	// 同理）。11133「模型不支持图片」指向的前提。
@@ -541,7 +562,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// 幂等：stickyUID 已空则空操作；不会误解绑其他轮的绑定。仅当 Session != nil 时 stickyUID 才会非空。
 	unbindSticky := func() {
 		if stickyUID != "" {
-			h.cfg.Session.Unbind(sessKey)
+			h.cfg.Session.Unbind(stickyKey)
 			stickyUID = ""
 		}
 	}
@@ -577,27 +598,41 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		body = rewriteModel(body, bareModel)
 	}
 
-	// 会话头族（issue #35）：后台按 X-Conversation-Request-ID（对话轮级）聚合请求，
-	// 官方客户端一次 user send 内所有 tool call/重试/换号复用同一个 ID。此处**轮转
-	// 循环外**生成一次，循环内每次出站原样复用 → 换号/重试/降级全部同 ID，后台不再
-	// 碎片化（此前网关一个都不发，上游按 HTTP 请求逐条记账，同一对话几十上百个
-	// RequestID）。
+	// 会话头族（issue #35 / #170）：后台按 X-Conversation-Request-ID 聚合请求，官方
+	// 客户端一次 user send 内所有 tool call/重试/换号复用同一个 ID。**统一轮级**
+	// （对齐官方桌面 CLI：TraceStartHook 每次 USER_PROMPT_SUBMIT 清空重生成
+	// conversationRequestId，同轮内复用、跨轮必换；官方云链路 lfConvReqId 的会话级
+	// 是服务端指令，走本网关的客户端不属于该形态）。此处**轮转循环外**生成一次，
+	// 循环内每次出站原样复用 → 换号/重试/降级全部同 ID，后台不再碎片化（此前网关
+	// 一个都不发，上游按 HTTP 请求逐条记账，同一对话几十上百个 RequestID）。
 	//   - conversationID：body 提取（透传客户端原值，缺省空串——不伪造，见
 	//     ResolveConversationID；官方后台不校验一致，空会话则不建立聚合键）；
 	//   - conversationRequestID：入站 X-Conversation-Request-ID 透传优先（客户端已
-	//     有自己的对话轮 ID 则以客户端为准），否则按粘性 key 进程内稳定生成（同会话
-	//     恒同值）；粘性 key 也为空时走轮级兜底（session.TurnKey/TurnRequestID），
-	//     无 user 消息时退化成本请求级 NewMessageID——轮转内捕获一次即共享；
+	//     有自己的对话轮 ID 则以客户端为准）。派生分两态：
+	//     * turnKey 非空（有末条 user 消息）→ 带会话键客户端走 TurnRequestID(
+	//       sessKey+":"+turnKey) 复合键（会话段入键保证不同会话同轮文本不互撞，
+	//       轮级粒度对齐官方 CLI）；无会话键客户端走既有 TurnRequestID(turnKey)
+	//       纯轮级键（存量会话键值零漂移）。
+	//     * turnKey 为空（残留空态：无 user 消息/无可签名内容）→ sessKey 非空时
+	//       回落 RequestIDForKey(sessKey)（会话级兜底，好于请求级随机）；sessKey
+	//       也空走 NewMessageID 请求级（TurnRequestID 空键行为）——轮转内捕获
+	//       一次即共享。
 	//   - messageID 在 ChatHeaders 内每条消息生成（消息级独立，无需外部可见）。
 	chatMeta := upstream.ChatMeta{ConversationID: session.ResolveConversationID(body)}
 	if v := r.Header.Get("X-Conversation-Request-ID"); v != "" {
 		chatMeta.ConversationRequestID = v
+	} else if turnKey != "" && sessKey != "" {
+		// 轮级复合键：sessKey 入键防跨会话同轮文本互撞。
+		chatMeta.ConversationRequestID = session.TurnRequestID(sessKey + ":" + turnKey)
+	} else if turnKey != "" {
+		// 无会话键客户端：纯轮级键（既有兜底语义不变，存量会话键值零漂移）。
+		chatMeta.ConversationRequestID = session.TurnRequestID(turnKey)
 	} else if sessKey != "" {
+		// 残留空态兜底：无轮可聚合时维持会话级聚合（同会话恒同值）。
 		chatMeta.ConversationRequestID = session.RequestIDForKey(sessKey)
 	} else {
-		// 无会话键客户端：轮级兜底——同轮内 tool call 多轮 / 换号重试 / 降级重发
-		// 共享同键，用户发下一条消息自动换键。
-		chatMeta.ConversationRequestID = session.TurnRequestID(turnKey)
+		// 无会话键也无轮级键：请求级随机（轮转内捕获一次即共享）。
+		chatMeta.ConversationRequestID = session.TurnRequestID("")
 	}
 	chatMeta.TraceID = r.Header.Get("X-Trace-ID")
 
@@ -775,8 +810,8 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		h.cfg.Pool.BlockModelClear(acct.UID, bareModel)
 		// 粘性跟随最终成功号：本轮成功的账号成为该会话的粘性绑定（覆盖旧绑定）。
 		// 若 sticky 号失败、轮换到别的号成功，这里把会话重绑到新号，多轮对话下一跳不再随机抽。
-		if sessKey != "" && h.cfg.Session != nil {
-			h.cfg.Session.Bind(sessKey, acct.UID)
+		if stickyKey != "" && h.cfg.Session != nil {
+			h.cfg.Session.Bind(stickyKey, acct.UID)
 		}
 		if peek.Stream {
 			// 流式：透传结束后立即关闭上游 body，避免 defer 在轮转场景下堆积 fd。
